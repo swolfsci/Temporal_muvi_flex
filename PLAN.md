@@ -4,7 +4,7 @@
 
 This builds a new Python package called **`tpacmon`** (Temporal PACMON) in the `Temporal_muvi_flex` repo. It extends the PACMon model (gene-set informed priors + covariate regression) by replacing the i.i.d. Normal prior on latent factors with a **Gaussian Process prior using a Matérn 3/2 kernel**, enabling flexible modeling of dependent repeated measurements without assuming equal temporal spacing.
 
-**Why this is needed:** MEFISTO (MOFA2) handles temporal data but (a) uses only the RBF kernel (`exp(-d²/2l²)`, confirmed in `mefisto.R:926`), which can over-smooth biological dynamics, (b) optimizes lengthscales via grid search (`n_grid=20`) rather than learning them jointly, (c) requires a Kronecker structure `K = s_k * K_group ⊗ K_covariate` that forces all groups to share the same covariate grid (equal temporal spacing), and (d) provides no gene-set priors or covariate regression. MuVI and PACMon ignore temporal dependency entirely. No existing tool combines (1) gene-set priors, (2) covariate regression, and (3) flexible irregular-time GP structure with per-patient masking.
+**Why this is needed:** MEFISTO (MOFA2) handles temporal data but (a) uses only the RBF kernel (`exp(-d²/2l²)`, confirmed in `mefisto.R:926`), which can over-smooth biological dynamics, (b) optimizes lengthscales via grid search (`n_grid=20`) rather than learning them jointly, (c) requires a Kronecker structure `K = s_k * K_group ⊗ K_covariate` that forces all groups to share the same covariate grid (equal temporal spacing), and (d) provides no gene-set priors or covariate regression. MuVI and PACMon ignore temporal dependency entirely. **mofaflex** (`bioFAM/mofaflex`) supports both GP priors on factors and `InformedHorseshoe` on weights, but these operate independently — there is no covariate-informed GP mean, no factor-level covariate regression (`gamma`), and no explicit per-patient irregular masking. No existing tool combines (1) gene-set priors, (2) dual-level covariate regression (feature-level `beta` + factor-level `gamma` shifting the GP trajectory), and (3) flexible irregular-time GP structure with per-patient masking.
 
 ---
 
@@ -31,20 +31,32 @@ Dense factors use `w_{k,j,m} ~ Normal(0, 1)`.
 
 ### Temporal Latent Factors — Covariate-informed GP prior (NON-LINEAR EXTENSION)
 ```
-New learnable parameter:
+New learnable parameters:
   gamma_k ~ Normal(0, 1)    shape: (n_covariates, n_factors)
+  zeta_k  ~ Beta(1, 1)      shape: (n_factors,)              # smoothness mixing weight
 
 For each patient p, factor k:
   mu_k(x_p)  = x_p @ gamma[:, k]            # covariate-shifted mean (n_timepoints_obs,)
   t_{p,obs}  = time_points[mask_p]           # actual observed times
   K_k        = Matérn32(t_{p,obs}, t_{p,obs}; l_k, a_k)
-  z_{p,k}    ~ MVN(mu_k(x_p) * ones, K_k)  # GP centered at covariate-informed mean
+
+  # Decomposed into GP (structured) + i.i.d. (unstructured) components:
+  f_{p,k}    ~ MVN(mu_k(x_p) * ones, K_k)   # GP component (temporal structure)
+  eta_{p,k}  ~ Normal(0, 1)                  # i.i.d. noise component (T_p_obs,)
+  z_{p,k}    = sqrt(1 - zeta_k) * f_{p,k} + sqrt(zeta_k) * eta_{p,k}
 ```
+
+**The `zeta_k` smoothness parameter** (inspired by mofaflex's approach):
+- `zeta_k → 0`: factor k is **fully temporal** — trajectories are smooth GP curves
+- `zeta_k → 1`: factor k is **i.i.d.** — behaves like standard PACMon (no temporal structure)
+- Learned per factor via SVI, so the model **automatically discovers which factors benefit from temporal structure**
+- This is critical because not all biological programs are temporal — some may be patient-specific constants
 
 **Interpretation:**
 - `gamma_{c,k}` = how much covariate `c` displaces patient p's expected trajectory for factor k
 - GP residual = individual deviation from the group-level trajectory
-- This is a **linear mixed effects** model at the factor level: fixed effects (covariates) + random effects (GP)
+- `zeta_k` = how much of factor k's variation is temporally structured vs. i.i.d.
+- This is a **linear mixed effects** model at the factor level: fixed effects (covariates) + random effects (GP + noise)
 - Still fully linear in `y`; non-linearity is only in the prior structure on `z`
 - `gamma` is identifiable because covariates are observed (unlike `z`)
 
@@ -84,16 +96,18 @@ All other sites (w, beta, sigma, lengthscale, amplitude) use diagonal Normal gui
 
 ## Comparison with MEFISTO (verified from codebase)
 
-| Aspect | MEFISTO | tpacmon (ours) |
-|--------|---------|----------------|
-| Kernel | RBF only (`exp(-d²/2l²)`) | Matérn 3/2 (default), 5/2, RBF |
-| Lengthscale optimization | Grid search (`n_grid=20`, every `opt_freq=10` iterations) | Learned jointly via SVI (LogNormal prior) |
-| Temporal structure | Kronecker `K_group ⊗ K_covariate` — forces shared covariate grid | Per-patient boolean mask on common grid — supports irregular spacing |
-| Gene-set priors | None | Regularized horseshoe with prior_scales modulation |
-| Covariate regression | None (covariates = time only) | `beta_m` (feature-level) + `gamma` (factor-level trajectory shift) |
-| Sparse GP | Optional (`frac_inducing=0.75`) | Planned via low-rank guide fallback |
-| Interpolation | GP conditional (R-side, mean only) | `predict()` returns mean + variance |
-| Warping/alignment | Yes (group alignment) | Not planned (single-group focus) |
+| Aspect | MEFISTO | mofaflex (`bioFAM/mofaflex`) | tpacmon (ours) |
+|--------|---------|------|----------------|
+| Kernel | RBF only | RBF + Matérn (via GPyTorch) | Matérn 3/2 (default), 5/2, RBF (pure torch) |
+| Lengthscale optimization | Grid search (`n_grid=20`) | Learned via SVI (GPyTorch constraints) | Learned via SVI (LogNormal prior) |
+| Temporal structure | Kronecker `K_group ⊗ K_covariate` — forces shared grid | Per-group covariates, sparse variational (inducing points) | Per-patient boolean mask on common grid |
+| Gene-set priors | None | `InformedHorseshoe` on weights (independent from GP) | Regularized horseshoe on weights (from PACMon) |
+| Factor-level covariate effect | None | None (GP mean is always zero) | `gamma` shifts GP mean per covariate — trajectory baseline |
+| Feature-level covariate regression | None | "Guiding variables" (auxiliary loss, regresses *on* factors) | `beta_m` (generative, regresses covariates *on* features) |
+| Smoothness discovery | Scale param `s_k` (0=independent, 1=smooth) | `zeta_k` (smoothness mixing) | `zeta_k ~ Beta(1,1)` per factor (GP vs. i.i.d. mixing) |
+| Sparse GP | Optional (`frac_inducing=0.75`) | Default 100 inducing points | Low-rank guide fallback for large T |
+| Interpolation | GP conditional (mean only, R-side) | Not documented | `predict()` returns mean + variance |
+| Framework | R wrapper → mofapy2 Python | Pyro + GPyTorch | Pyro (no GPyTorch dependency) |
 
 ---
 
@@ -129,16 +143,19 @@ Large ontologies (GO, Hallmarks, Reactome) contain hundreds of redundant, overla
 
 ### Component A — Predictive Pre-Screening (soft down-weighting, biology-preserving)
 
-**No gene sets are ever discarded.** Instead, each gene set's `prior_confidence` is scaled by its predictive R², so uninformative sets get looser priors while informative sets get tighter priors. The model still sees every gene set — it just trusts them proportionally.
+**No gene sets are ever discarded.** Instead, each gene set's `prior_confidence` is scaled by a variance-based informativeness score, so uninformative sets get looser priors while informative sets get tighter priors. The model still sees every gene set — it just trusts them proportionally.
+
+**Fast scoring approach** (avoids per-gene-set cross-validated regression):
 
 For each gene set S_g with member genes G_g:
-1. Compute gene set activity score per sample: `score_p = mean(X_p[G_g])` (simple mean aggregation)
-2. Fit a cross-validated Ridge regression: `y_pv ~ score_p` for each omics view
-3. Compute mean cross-validated R² across views → `r2_g ∈ [0, 1]`
-4. **Scale prior confidence**: `conf_g = base_confidence * (1 + r2_g) / 2`
-   - `r2_g = 0` (no signal) → `conf_g = base_conf / 2` (very loose prior, model barely constrained)
-   - `r2_g = 0.5` → `conf_g = 0.75 * base_conf` (moderate prior)
-   - `r2_g = 1.0` (perfect prediction) → `conf_g = base_conf` (full prior confidence)
+1. Compute gene set activity score per sample: `score_g_p = mean(X_p[G_g])` for each view
+2. Compute **variance explained**: for each view, calculate `corr(score_g, PC_1..5)²` — the squared correlation between the gene set activity and the top 5 PCs of that view. Take the max across PCs and mean across views → `ve_g ∈ [0, 1]`
+3. **Scale prior confidence**: `conf_g = base_confidence * (1 + ve_g) / 2`
+   - `ve_g = 0` (no signal) → `conf_g = base_conf / 2` (very loose prior)
+   - `ve_g = 0.5` → `conf_g = 0.75 * base_conf` (moderate prior)
+   - `ve_g = 1.0` (perfect correlation with top PCs) → `conf_g = base_conf` (full confidence)
+
+**Why this is fast**: PCA is computed once per view (not per gene set). Then scoring each gene set is just a mean + correlation — O(P) per gene set. For 500 gene sets × 3 views this takes seconds, not minutes.
 
 ```python
 def compute_gene_set_weights(
@@ -146,13 +163,13 @@ def compute_gene_set_weights(
     gene_sets: dict[str, list[str]],       # name -> gene list
     feature_names: dict[str, list[str]],   # view -> feature names
     base_confidence: float = 0.99,         # base prior confidence
-    cv: int = 5,                           # cross-validation folds
+    n_components: int = 5,                 # PCs to correlate against
 ) -> dict[str, float]:                    # name -> scaled prior_confidence
 ```
 
-**Key design note**: Use `sklearn.linear_model.RidgeCV`. Fast on modern machines even for 500+ gene sets. The per-gene-set `prior_confidence` values are then passed directly into the `TemporalPACMON` constructor, overriding the single global `prior_confidence`.
+**Optional slow mode** (`method="ridge"`): For users who want more precise scoring, offer a fallback using `sklearn.linear_model.RidgeCV` per gene set per view (cross-validated R²). This is more accurate but ~100x slower for large ontologies. Default is `method="pca_correlation"`.
 
-**Optional calibration**: For small sample sizes (P < 50), Ridge R² can be noisy. Offer an optional `permutation_test: bool = False` parameter. When enabled, compute a permutation-based null distribution (default 100 permutations) for each gene set's R², and only up-weight gene sets whose R² exceeds the 95th percentile of the null. This adds compute time but guards against false confidence in small cohorts.
+**Optional calibration**: For small sample sizes (P < 50), offer `permutation_test: bool = False`. When enabled, compute a permutation-based null distribution (100 permutations) to calibrate scores. Only up-weight gene sets exceeding the 95th percentile of the null.
 
 ### Component B — Hierarchical Merging (reduce redundancy)
 
@@ -394,10 +411,11 @@ Generates ground-truth Z from GP, W from horseshoe, Y from normal likelihood. Us
 
 ### Step 7 — `gene_set_prep.py` — preprocessing pipeline
 - `screen_gene_sets()`: RidgeCV R² filter, returns subset of gene set dict
+- `compute_gene_set_weights()`: Fast PCA-correlation scoring (default) or slow RidgeCV (`method="ridge"`)
 - `merge_gene_sets()`: Jaccard matrix → Ward linkage → dendrogram cut → union merging
-- `prepare_gene_sets()`: Combined one-call interface
+- `prepare_gene_sets()`: Combined one-call interface (score → merge → return)
 
-Dependencies: `sklearn` (RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster) — already in PACMon deps.
+Dependencies: `sklearn` (PCA, RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster) — already in PACMon deps.
 
 ### Step 8 — `signatures.py` — post-hoc prediction
 - `compute_predictive_signatures()`: ElasticNetCV per factor, returns DataFrame of weights
@@ -429,7 +447,8 @@ Dependencies: `sklearn` (RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster)
 | Jitter | 1e-5 adaptive to 1e-4 | Ensures positive-definiteness; adapts if Cholesky fails |
 | Gradient clipping | max_norm=10.0 | GP + horseshoe produces spiky gradients; prevents divergence |
 | Device handling | `"auto"` with graceful CPU fallback | No hard CUDA dependency; works on any machine |
-| GS screening | RidgeCV R² filter + optional permutation null | Fast, data-driven; permutation test guards small cohorts |
+| Smoothness parameter | `zeta_k ~ Beta(1,1)` per factor | Auto-discovers temporal vs. i.i.d. factors; inspired by mofaflex |
+| GS screening | PCA-correlation (default, fast) + optional RidgeCV (slow, precise) | PCA is O(P) per gene set; RidgeCV fallback for precision |
 | GS merging | Jaccard + Ward linkage | Simple, interpretable, well-established in bioinformatics |
 | Signature extraction | ElasticNetCV | L1 sparsity for feature selection + L2 for correlated features; no new deps |
 | Temporal interpolation | GP conditional prediction via `predict()` | Key selling point; free with GP model, enables clinical forecasting |
