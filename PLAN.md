@@ -4,7 +4,7 @@
 
 This builds a new Python package called **`tpacmon`** (Temporal PACMON) in the `Temporal_muvi_flex` repo. It extends the PACMon model (gene-set informed priors + covariate regression) by replacing the i.i.d. Normal prior on latent factors with a **Gaussian Process prior using a Matérn 3/2 kernel**, enabling flexible modeling of dependent repeated measurements without assuming equal temporal spacing.
 
-**Why this is needed:** MEFISTO (MOFA2) handles temporal data but assumes the same number of time points per subject and uses only RBF kernels. MuVI and PACMon ignore temporal dependency entirely. No existing tool combines (1) gene-set priors, (2) covariate regression, and (3) flexible irregular-time GP structure.
+**Why this is needed:** MEFISTO (MOFA2) handles temporal data but (a) uses only the RBF kernel (`exp(-d²/2l²)`, confirmed in `mefisto.R:926`), which can over-smooth biological dynamics, (b) optimizes lengthscales via grid search (`n_grid=20`) rather than learning them jointly, (c) requires a Kronecker structure `K = s_k * K_group ⊗ K_covariate` that forces all groups to share the same covariate grid (equal temporal spacing), and (d) provides no gene-set priors or covariate regression. MuVI and PACMon ignore temporal dependency entirely. No existing tool combines (1) gene-set priors, (2) covariate regression, and (3) flexible irregular-time GP structure with per-patient masking.
 
 ---
 
@@ -50,6 +50,8 @@ For each patient p, factor k:
 
 **Changes to `beta_m`**: The `beta_m` regression module still exists (for the observation-level covariate effect on features), but now `gamma` handles the covariate effect at the *latent factor level*. Both are simultaneously identifiable with appropriate priors.
 
+**Relationship to PACMon's `conditions`**: PACMon already has a `conditions` mechanism (`models.py:3007-3013`) where `z_loc = conditions @ w_condition + b_condition`. Our `gamma` **subsumes and replaces** this: instead of a flat shift to the factor mean, `gamma` shifts the GP mean, producing a covariate-informed *trajectory* baseline. The `conditions` parameter is therefore not carried forward; users should use `covariates` for both the factor-level (`gamma`) and feature-level (`beta`) effects.
+
 ### Patient-level Covariate Regression (from PACMon — adapted)
 ```
 beta_m ~ Normal(0, 1)    shape: (n_covariates, n_features_m)
@@ -74,6 +76,25 @@ For each patient p, factor k:
 ```
 All other sites (w, beta, sigma, lengthscale, amplitude) use diagonal Normal guide (as in PACMon).
 
+**Scalability note — Low-rank guide fallback**: The full Cholesky MVN stores `L_{p,k}` of size `(T_p_obs × T_p_obs)` per patient per factor. For moderate T (≤30) this is fine, but for large T (50+), offer a `LowRankMultivariateNormal` alternative (rank-r + diagonal), reducing parameters from O(T²) to O(rT). Implement as a `guide_type` option: `"cholesky"` (default) or `"lowrank"`.
+
+**Batching note**: Since guide parameters for `z` are per-patient, mini-batching over patients requires indexing into a stored parameter tensor (not amortization). Store `mu_z` and `L_z` as `PyroParam` tensors indexed by patient ID within each mini-batch. This is consistent with PACMon's existing batching pattern.
+
+---
+
+## Comparison with MEFISTO (verified from codebase)
+
+| Aspect | MEFISTO | tpacmon (ours) |
+|--------|---------|----------------|
+| Kernel | RBF only (`exp(-d²/2l²)`) | Matérn 3/2 (default), 5/2, RBF |
+| Lengthscale optimization | Grid search (`n_grid=20`, every `opt_freq=10` iterations) | Learned jointly via SVI (LogNormal prior) |
+| Temporal structure | Kronecker `K_group ⊗ K_covariate` — forces shared covariate grid | Per-patient boolean mask on common grid — supports irregular spacing |
+| Gene-set priors | None | Regularized horseshoe with prior_scales modulation |
+| Covariate regression | None (covariates = time only) | `beta_m` (feature-level) + `gamma` (factor-level trajectory shift) |
+| Sparse GP | Optional (`frac_inducing=0.75`) | Planned via low-rank guide fallback |
+| Interpolation | GP conditional (R-side, mean only) | `predict()` returns mean + variance |
+| Warping/alignment | Yes (group alignment) | Not planned (single-group focus) |
+
 ---
 
 ## Alternative Temporal Priors (not implemented but worth noting)
@@ -86,6 +107,18 @@ All other sites (w, beta, sigma, lengthscale, amplitude) use diagonal Normal gui
 | OU (Matérn 1/2) | `exp(-d/l)` | C⁰ only, good for noisy/rapid changes |
 | Sparse GP (SVGP) | Inducing points M<<T | Scales to many patients/timepoints |
 | Linear State Space | Kalman-like recursion | Only equal spacing; fast O(T) |
+
+---
+
+## Numerical Stability & Training Robustness
+
+GP kernels combined with horseshoe priors create a challenging optimization landscape. The following defaults should be applied:
+
+1. **Jitter**: 1e-5 on kernel diagonal (already specified). Increase adaptively to 1e-4 if Cholesky decomposition fails during training.
+2. **Double precision**: Offer a `double_precision: bool = False` option on `TemporalPACMON`. When enabled, kernel computations run in float64 to avoid numerical issues with near-singular covariance matrices.
+3. **Gradient clipping**: Apply `torch.nn.utils.clip_grad_norm_` with `max_norm=10.0` in the SVI loop. GP log-det gradients and horseshoe scale gradients can spike.
+4. **Learning rate schedule**: Use `ClipLR` or `ReduceLROnPlateau` scheduler (configurable). Default: cosine annealing over the specified number of epochs.
+5. **ELBO scaling**: Use `pyro.poutine.scale` to balance the GP prior log-likelihood against the observation likelihood when the number of observations per patient varies widely. Default scale factor = `1.0` (no scaling), but expose as `gp_scale: float` parameter.
 
 ---
 
@@ -118,6 +151,8 @@ def compute_gene_set_weights(
 ```
 
 **Key design note**: Use `sklearn.linear_model.RidgeCV`. Fast on modern machines even for 500+ gene sets. The per-gene-set `prior_confidence` values are then passed directly into the `TemporalPACMON` constructor, overriding the single global `prior_confidence`.
+
+**Optional calibration**: For small sample sizes (P < 50), Ridge R² can be noisy. Offer an optional `permutation_test: bool = False` parameter. When enabled, compute a permutation-based null distribution (default 100 permutations) for each gene set's R², and only up-weight gene sets whose R² exceeds the 95th percentile of the null. This adds compute time but guards against false confidence in small cohorts.
 
 ### Component B — Hierarchical Merging (reduce redundancy)
 
@@ -183,6 +218,7 @@ def compute_predictive_signatures(
 - `"mean"`: Average factor scores across observed timepoints per patient
 - `"last"`: Use last observed timepoint (e.g., endpoint outcome)
 - `"max"`: Use peak factor activation
+- `"slope"`: Fit a simple linear trend per patient per factor, use the slope as summary. Captures *trajectory direction*, which is often the clinically relevant signal (e.g., improving vs. declining patients).
 
 **Output**:
 - `signatures[k]`: dict with `features` (list), `weights` (dict), `cv_r2` (float)
@@ -216,7 +252,9 @@ Temporal_muvi_flex/
 │   ├── test_model.py
 │   ├── test_gene_set_prep.py
 │   ├── test_signatures.py
-│   └── test_synthetic.py
+│   ├── test_synthetic.py
+│   ├── test_integration.py
+│   └── test_predict.py
 └── notebooks/
     └── example_longitudinal.ipynb
 ```
@@ -225,16 +263,27 @@ Temporal_muvi_flex/
 
 ## Critical Files to Borrow From
 
-| Source | File | What to reuse |
-|--------|------|---------------|
-| `pacmon_flex` | `pacmon/core/models.py:54` | `PACMON.__init__`, prior setup, SVI loop, horseshoe prior (lines 2859–2900), covariate plates (lines 2940–2949) |
-| `pacmon_flex` | `pacmon/core/models.py:2661` | `PACMONModel` — reuse all loading/covariate logic; replace `z` prior only |
-| `pacmon_flex` | `pacmon/core/models.py:3051` | `PACMONGuide` — reuse all except `z` site; replace with structured MVN guide |
-| `pacmon_flex` | `pacmon/core/callbacks.py` | Copy directly |
-| `pacmon_flex` | `pacmon/core/early_stopping.py` | Copy directly |
-| `pacmon_flex` | `pacmon/tools/feature_sets.py` | Copy directly |
-| `muvi_flex` | `muvi/core/models.py:483` | `_setup_prior_confidence`, `_setup_prior_masks` — copy pattern |
-| `MOFA2_flex` | `R/mefisto.R:926` | Conceptual: kernel formula, lengthscale grid search |
+| Source | File | What to reuse | Verified |
+|--------|------|---------------|----------|
+| `pacmon_flex` | `pacmon/core/models.py:54-118` | `PACMON.__init__` — constructor signature, parameter validation | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:529-758` | `_setup_prior_masks()` — prior scales computation: `clip(mask + (1-confidence), 1e-8, 1.0)` | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:2661-3048` | `PACMONModel` — horseshoe prior (2867-2908), beta regression (2940-2949), view scaling (2751-2756). Replace z sampling at 3007-3013 only | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:3051-3382` | `PACMONGuide` — site_to_shape setup (3100-3168), `_sample()` method, extraction methods. Replace z site with structured MVN | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:1616-1692` | Optimizer setup (ClippedAdam with LR decay) and SVI setup (TraceMeanField_ELBO) | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:1775-1937` | `fit()` — training loop with callbacks, early stopping, checkpoints | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:1460-1563` | `_decompose()` — SVD initialization (adapt for temporal: average over time first) | Yes |
+| `pacmon_flex` | `pacmon/core/models.py:1938-2310` | `save()`/`load()` — serialize guide params as numpy. Extend for ragged Cholesky tensors | Yes |
+| `pacmon_flex` | `pacmon/core/callbacks.py` | Copy directly (CheckpointCallback, LogCallback with sparsity/RMSE/R² tracking) | Yes |
+| `pacmon_flex` | `pacmon/core/early_stopping.py` | Copy directly (min_epochs=100, tolerance=1e-5, patience=10) | Yes |
+| `pacmon_flex` | `pacmon/tools/feature_sets.py` | Copy directly (FeatureSet/FeatureSets classes, GMT I/O, `to_mask()`) | Yes |
+| `MuVI_flex` | `muvi/core/models.py:483-509` | `_setup_prior_confidence()` — maps "low"→0.99, "med"→0.995, "high"→0.999 | Yes |
+| `MuVI_flex` | `muvi/core/models.py:511-713` | `_setup_prior_masks()` — mask alignment, feature matching, prior_scales computation | Yes |
+| `MOFA2_flex` | `R/mefisto.R:206-242` | Conceptual: MEFISTO options (grid search for lengthscale, sparse GP, warping). We improve: learn lengthscales via SVI instead of grid search | Yes |
+| `MOFA2_flex` | `R/mefisto.R:922-930` | Conceptual: GP conditional prediction `K*K⁻¹z`. MEFISTO uses RBF only (`exp(-d²/2l²)`); we use Matérn 3/2 | Yes |
+
+**Note on PACMon's `conditions`**: PACMon has both `conditions` (affect z_loc at factor level, `models.py:3007-3013`) and `covariates` (affect y via beta at feature level, `models.py:2940-2949`). Our `gamma` parameter replaces `conditions` — it shifts the GP mean instead of z_loc. The `conditions` pathway is **not carried forward** into tpacmon.
+
+**Note on save/load**: PACMon serializes guide parameters via `get_state()` (`models.py:1938-2022`) into `metadata.json`, `params.npz`, `structure.npz`. For tpacmon, we extend this to store: (a) per-patient Cholesky tensors (padded to max T with mask), (b) kernel hyperparameters (lengthscales, amplitudes), (c) temporal metadata (time_points, patient_masks).
 
 ---
 
@@ -313,16 +362,24 @@ class TemporalPACMON(PyroModule):
         kernel: str = "matern32",               # 'matern32'|'matern52'|'rbf'
         likelihoods: Optional[dict] = None,
         normalize: bool = True,
-        device: str = "cuda",
+        shared_lengthscale: bool = False,  # if True, one lengthscale shared across all factors
+        guide_type: str = "cholesky",     # 'cholesky' or 'lowrank'
+        gp_scale: float = 1.0,            # scale factor for GP prior log-likelihood
+        double_precision: bool = False,    # float64 for kernel computations
+        device: str = "auto",             # 'auto' detects CUDA, falls back to CPU gracefully
     )
 ```
 - `_setup_observations()`: flatten `(P, T, D_m)` to `(P*T, D_m)` with mask tracking
 - `_setup_temporal()`: validate time_points and patient_masks
 - `_setup_model_guide()`: instantiate TemporalModel + TemporalGuide
-- `fit()`: standard SVI loop (copy from PACMon, patient-level batching)
+- `_decompose()`: **Temporal SVD initialization** — average observations over time per patient to get `(P, D_total)`, run SVD as in PACMon (`models.py:1460-1563`) to get `Z_init (P, K)` and `W_init (K, D_total)`. Then tile `Z_init` across observed timepoints: `z_init[p, t, k] = Z_init[p, k]` for all observed `t`. This gives a reasonable starting point for the GP posterior means.
+- `fit()`: standard SVI loop (copy from PACMon's `fit()` at `models.py:1775-1937`, using ClippedAdam with exponential LR decay). Add gradient clipping on top.
 - `get_factors()`: return `(P, T, K)` factor scores
 - `get_loadings()`: return `(K, D_m)` per view
 - `get_lengthscales()`: return `(K,)` learned temporal lengthscales
+- `predict(new_time_points)`: GP posterior prediction at unobserved times — returns `(P, T_new, K)` mean and variance. Uses standard GP conditional: `mu* = K*K⁻¹z`, `Sigma* = K** - K*K⁻¹K*ᵀ`. This is a key advantage over non-temporal models.
+- `compute_elbo()`: evaluate ELBO on held-out data for model comparison (tpacmon vs. PACMon baseline)
+- `score_holdout(held_out_timepoints)`: predict held-out timepoints and report MSE/log-likelihood, for temporal cross-validation
 
 ### Step 6 — `synthetic.py` — data simulator
 ```python
@@ -353,6 +410,8 @@ Dependencies: `sklearn` (RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster)
 - `test_synthetic.py`: simulator produces correct shapes and structure
 - `test_gene_set_prep.py`: screening reduces gene sets; merging reduces redundancy
 - `test_signatures.py`: ElasticNet returns correct shapes; zero weights for unrelated features
+- `test_integration.py`: **End-to-end pipeline test** — `prepare_gene_sets() → TemporalPACMON.fit() → compute_predictive_signatures()` on synthetic data. Verifies the full workflow runs without error and produces sensible outputs.
+- `test_predict.py`: Temporal interpolation/extrapolation via `predict()` — verify GP conditional mean/variance at held-out timepoints are close to ground truth on synthetic data.
 
 ---
 
@@ -361,31 +420,19 @@ Dependencies: `sklearn` (RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster)
 | Decision | Choice | Reason |
 |----------|--------|--------|
 | Kernel | Matérn 3/2 | C¹ smooth, appropriate for biological dynamics, handles irregular spacing |
-| Variational family for z | Structured MVN (Cholesky) | Captures temporal correlations in posterior; mean-field would ignore them |
+| Variational family for z | Structured MVN (Cholesky), with low-rank fallback | Captures temporal correlations in posterior; low-rank option for T>30 |
 | Ragged structure | Common grid + boolean mask | Avoids per-patient variable-size tensors; consistent with PACMon batching |
 | Covariates | Patient-level only | Broadcast across timepoints; simpler β shape (P×C instead of P×T×C) |
 | Kernel parameters | Learnable via SVI (LogNormal prior) | Automatically adapts lengthscale per factor; no grid search needed |
+| Lengthscale sharing | Per-factor (default), optional shared mode | Per-factor captures factor-specific dynamics; shared mode for sparse data |
 | Base framework | Pyro SVI (same as PACMon) | Consistent with entire MuVI/PACMon codebase; no new dependencies |
-| Jitter | 1e-5 added to kernel diagonal | Ensures positive-definiteness for Cholesky |
-
----
-
----
-
-## Key Technical Decisions
-
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| Kernel | Matérn 3/2 | C¹ smooth, appropriate for biological dynamics, handles irregular spacing |
-| Variational family for z | Structured MVN (Cholesky) | Captures temporal correlations in posterior; mean-field would ignore them |
-| Ragged structure | Common grid + boolean mask | Avoids per-patient variable-size tensors; consistent with PACMon batching |
-| Covariates | Patient-level only | Broadcast across timepoints; simpler β shape (P×C instead of P×T×C) |
-| Kernel parameters | Learnable via SVI (LogNormal prior) | Automatically adapts lengthscale per factor; no grid search needed |
-| Base framework | Pyro SVI (same as PACMon) | Consistent with entire MuVI/PACMon codebase; no new dependencies |
-| Jitter | 1e-5 added to kernel diagonal | Ensures positive-definiteness for Cholesky |
-| GS screening | RidgeCV R² filter | Fast, data-driven, no hyperparameter tuning required |
+| Jitter | 1e-5 adaptive to 1e-4 | Ensures positive-definiteness; adapts if Cholesky fails |
+| Gradient clipping | max_norm=10.0 | GP + horseshoe produces spiky gradients; prevents divergence |
+| Device handling | `"auto"` with graceful CPU fallback | No hard CUDA dependency; works on any machine |
+| GS screening | RidgeCV R² filter + optional permutation null | Fast, data-driven; permutation test guards small cohorts |
 | GS merging | Jaccard + Ward linkage | Simple, interpretable, well-established in bioinformatics |
 | Signature extraction | ElasticNetCV | L1 sparsity for feature selection + L2 for correlated features; no new deps |
+| Temporal interpolation | GP conditional prediction via `predict()` | Key selling point; free with GP model, enables clinical forecasting |
 
 ---
 
@@ -398,3 +445,7 @@ Dependencies: `sklearn` (RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster)
 5. **Compare to PACMon**: On non-temporal data (all patients same single timepoint), results should match PACMon baseline
 6. **Gene set prep**: Run `prepare_gene_sets()` with a small GO subset; verify fewer sets returned post-screening/merging
 7. **Signatures**: Run `compute_predictive_signatures()` on fitted model; verify non-zero weights only for relevant features
+8. **Temporal interpolation**: Use `predict()` at held-out timepoints; verify GP conditional mean is close to ground truth on synthetic data
+9. **End-to-end pipeline**: `prepare_gene_sets() → fit() → predict() → compute_predictive_signatures()` runs without error on synthetic data
+10. **Model comparison**: On non-temporal data, compare `compute_elbo()` between tpacmon (single timepoint) and PACMon; should be equivalent
+11. **Device fallback**: Verify model trains correctly on CPU when CUDA is unavailable
