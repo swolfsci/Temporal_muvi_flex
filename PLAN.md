@@ -141,35 +141,22 @@ GP kernels combined with horseshoe priors create a challenging optimization land
 ### Problem
 Large ontologies (GO, Hallmarks, Reactome) contain hundreds of redundant, overlapping gene sets. Including them all inflates model complexity, reduces effective degrees of freedom, and degrades interpretability — most gene sets explain no variance.
 
-### Component A — Predictive Pre-Screening (soft down-weighting, biology-preserving)
+### Component A — Size Filtering (via FeatureSets.filter())
 
-**No gene sets are ever discarded.** Instead, each gene set's `prior_confidence` is scaled by a variance-based informativeness score, so uninformative sets get looser priors while informative sets get tighter priors. The model still sees every gene set — it just trusts them proportionally.
-
-**Fast scoring approach** (avoids per-gene-set cross-validated regression):
-
-For each gene set S_g with member genes G_g:
-1. Compute gene set activity score per sample: `score_g_p = mean(X_p[G_g])` for each view
-2. Compute **variance explained**: for each view, calculate `corr(score_g, PC_1..5)²` — the squared correlation between the gene set activity and the top 5 PCs of that view. Take the max across PCs and mean across views → `ve_g ∈ [0, 1]`
-3. **Scale prior confidence**: `conf_g = base_confidence * (1 + ve_g) / 2`
-   - `ve_g = 0` (no signal) → `conf_g = base_conf / 2` (very loose prior)
-   - `ve_g = 0.5` → `conf_g = 0.75 * base_conf` (moderate prior)
-   - `ve_g = 1.0` (perfect correlation with top PCs) → `conf_g = base_conf` (full confidence)
-
-**Why this is fast**: PCA is computed once per view (not per gene set). Then scoring each gene set is just a mean + correlation — O(P) per gene set. For 500 gene sets × 3 views this takes seconds, not minutes.
+Use the existing `FeatureSets.filter()` method (copied from `pacmon_flex/pacmon/tools/feature_sets.py`) to remove gene sets that are too small or too large to be informative:
 
 ```python
-def compute_gene_set_weights(
-    data: dict[str, np.ndarray],          # view -> (P, D_m) [averaged over time for temporal data]
-    gene_sets: dict[str, list[str]],       # name -> gene list
-    feature_names: dict[str, list[str]],   # view -> feature names
-    base_confidence: float = 0.99,         # base prior confidence
-    n_components: int = 5,                 # PCs to correlate against
-) -> dict[str, float]:                    # name -> scaled prior_confidence
+gene_sets.filter(
+    features=all_feature_names,
+    min_count=5,          # drop gene sets with fewer than 5 overlapping features
+    max_count=500,        # drop gene sets larger than 500 (too broad to be specific)
+    min_fraction=0.5,     # at least 50% of gene set members must be in the data
+)
 ```
 
-**Optional slow mode** (`method="ridge"`): For users who want more precise scoring, offer a fallback using `sklearn.linear_model.RidgeCV` per gene set per view (cross-validated R²). This is more accurate but ~100x slower for large ontologies. Default is `method="pca_correlation"`.
+This is instant and removes the obvious junk (tiny sets, genome-wide sets). No learning step needed.
 
-**Optional calibration**: For small sample sizes (P < 50), offer `permutation_test: bool = False`. When enabled, compute a permutation-based null distribution (100 permutations) to calibrate scores. Only up-weight gene sets exceeding the 95th percentile of the null.
+**The horseshoe prior handles the rest.** The regularized horseshoe with prior_scales modulation (`clip(mask + (1-confidence), 1e-8, 1.0)`) already shrinks uninformative gene set loadings to zero. Trying to pre-learn which gene sets matter is redundant — the model does this during training, and it does it better because it sees the full multi-view structure.
 
 ### Component B — Hierarchical Merging (reduce redundancy)
 
@@ -193,9 +180,15 @@ def merge_gene_sets(
 
 ### Component C — Combined pipeline
 ```python
-def prepare_gene_sets(data, gene_sets, feature_names, ...):
-    filtered = screen_gene_sets(data, gene_sets, ...)
-    merged, provenance = merge_gene_sets(filtered, ...)
+def prepare_gene_sets(
+    gene_sets: FeatureSets,
+    feature_names: list[str],
+    min_count: int = 5,
+    max_count: int = 500,
+    similarity_threshold: float = 0.5,
+) -> tuple[FeatureSets, dict[str, list[str]]]:
+    filtered = gene_sets.filter(features=feature_names, min_count=min_count, max_count=max_count)
+    merged, provenance = merge_gene_sets(filtered, similarity_threshold=similarity_threshold)
     return merged, provenance
 ```
 
@@ -411,11 +404,10 @@ Generates ground-truth Z from GP, W from horseshoe, Y from normal likelihood. Us
 
 ### Step 7 — `gene_set_prep.py` — preprocessing pipeline
 - `screen_gene_sets()`: RidgeCV R² filter, returns subset of gene set dict
-- `compute_gene_set_weights()`: Fast PCA-correlation scoring (default) or slow RidgeCV (`method="ridge"`)
 - `merge_gene_sets()`: Jaccard matrix → Ward linkage → dendrogram cut → union merging
-- `prepare_gene_sets()`: Combined one-call interface (score → merge → return)
+- `prepare_gene_sets()`: Combined one-call interface (size filter → merge → return)
 
-Dependencies: `sklearn` (PCA, RidgeCV), `scipy.cluster.hierarchy` (linkage, fcluster) — already in PACMon deps.
+Dependencies: `scipy.cluster.hierarchy` (linkage, fcluster) — already in PACMon deps. No sklearn needed for this module.
 
 ### Step 8 — `signatures.py` — post-hoc prediction
 - `compute_predictive_signatures()`: ElasticNetCV per factor, returns DataFrame of weights
@@ -448,7 +440,7 @@ Dependencies: `sklearn` (PCA, RidgeCV), `scipy.cluster.hierarchy` (linkage, fclu
 | Gradient clipping | max_norm=10.0 | GP + horseshoe produces spiky gradients; prevents divergence |
 | Device handling | `"auto"` with graceful CPU fallback | No hard CUDA dependency; works on any machine |
 | Smoothness parameter | `zeta_k ~ Beta(1,1)` per factor | Auto-discovers temporal vs. i.i.d. factors; inspired by mofaflex |
-| GS screening | PCA-correlation (default, fast) + optional RidgeCV (slow, precise) | PCA is O(P) per gene set; RidgeCV fallback for precision |
+| GS screening | Size filter only; horseshoe does the rest | No learning step — horseshoe already shrinks uninformative sets to zero |
 | GS merging | Jaccard + Ward linkage | Simple, interpretable, well-established in bioinformatics |
 | Signature extraction | ElasticNetCV | L1 sparsity for feature selection + L2 for correlated features; no new deps |
 | Temporal interpolation | GP conditional prediction via `predict()` | Key selling point; free with GP model, enables clinical forecasting |
