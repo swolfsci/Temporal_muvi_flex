@@ -238,59 +238,55 @@ class TemporalModel(PyroModule):
             n_t = t_obs.shape[0]
             n_group = group_pats.shape[0]
 
-            # Build kernel matrices for all factors at once: (K, T, T)
-            K_all = torch.stack([
-                build_kernel(
-                    self.kernel_name, t_obs,
-                    lengthscales[k] if self.n_factors > 1 else lengthscales,
-                    amplitudes[k] if self.n_factors > 1 else amplitudes,
-                    jitter=1e-5,
-                )
-                for k in range(self.n_factors)
-            ])  # (K, T, T)
+            # Build kernel matrices for all factors: (K, T, T)
+            if self.n_factors > 1:
+                K_all = torch.stack([
+                    build_kernel(self.kernel_name, t_obs, lengthscales[k], amplitudes[k], jitter=1e-5)
+                    for k in range(self.n_factors)
+                ])  # (K, T, T)
+            else:
+                K_all = build_kernel(self.kernel_name, t_obs, lengthscales, amplitudes, jitter=1e-5).unsqueeze(0)
 
-            # GP mean per patient per factor: (n_group, K, T)
+            # GP mean: (n_group, K, T)
             if self.n_covariates > 0 and covs is not None:
-                # covs: (P, C), gamma: (C, K) -> gp_means: (n_group, K)
                 gp_means_scalar = covs[group_pats] @ output_dict["gamma"]  # (n_group, K)
                 gp_means = gp_means_scalar.unsqueeze(-1).expand(n_group, self.n_factors, n_t)
             else:
                 gp_means = self._zeros((n_group, self.n_factors, n_t))
 
-            # Sample f: one batched MVN per factor across all group patients
-            # Shape: (n_group, K, T)
-            f_group = self._zeros((n_group, self.n_factors, n_t))
-            eta_group = self._zeros((n_group, self.n_factors, n_t))
+            # Sample f: batch over (patients, factors) with just 1 pyro.sample call
+            # Use Cholesky of each K_k to reparameterize: f = mu + L @ eps
+            # where eps ~ Normal(0, I), so we sample eps as (n_group, K, T)
+            L_all = torch.linalg.cholesky(K_all)  # (K, T, T)
 
             group_plate = pyro.plate(f"group_{g_idx}", n_group, dim=-1)
 
-            for k in range(self.n_factors):
-                # Batched MVN: all patients in group share same kernel
-                with pyro.poutine.scale(scale=self.gp_scale):
-                    with group_plate:
-                        f_k = pyro.sample(
-                            f"f_g{g_idx}_k{k}",
-                            dist.MultivariateNormal(
-                                gp_means[:, k, :],  # (n_group, T)
-                                covariance_matrix=K_all[k],  # (T, T) broadcast
-                            ),
-                        )  # (n_group, T)
-                f_group[:, k, :] = f_k
-
+            with pyro.poutine.scale(scale=self.gp_scale):
                 with group_plate:
-                    eta_k = pyro.sample(
-                        f"eta_g{g_idx}_k{k}",
+                    f_eps = pyro.sample(
+                        f"f_g{g_idx}",
                         dist.Normal(
-                            self._zeros((n_group, n_t)),
-                            self._ones((n_group, n_t)),
-                        ).to_event(1),
-                    )  # (n_group, T)
-                eta_group[:, k, :] = eta_k
+                            self._zeros((n_group, self.n_factors, n_t)),
+                            self._ones((n_group, self.n_factors, n_t)),
+                        ).to_event(2),  # event = (K, T), batch = (n_group,)
+                    )  # (n_group, K, T)
+
+            # f = mu + L @ eps  (L is (K,T,T), eps is (n_group,K,T))
+            f_group = gp_means + torch.einsum("kij,nkj->nki", L_all, f_eps)
+
+            # eta: i.i.d. component (n_group, K, T) — 1 sample call
+            with group_plate:
+                eta_group = pyro.sample(
+                    f"eta_g{g_idx}",
+                    dist.Normal(
+                        self._zeros((n_group, self.n_factors, n_t)),
+                        self._ones((n_group, self.n_factors, n_t)),
+                    ).to_event(2),
+                )  # (n_group, K, T)
 
             # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*eta
             zeta_exp = zetas.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
             z_group = torch.sqrt(1 - zeta_exp) * f_group + torch.sqrt(zeta_exp) * eta_group
-            # z_group: (n_group, K, T)
 
             # Scatter into z_all: map group patients to their obs rows
             for i, p in enumerate(group_pats):
@@ -534,7 +530,7 @@ class TemporalGuide(PyroModule):
                 with gamma_plate_fac:
                     output_dict["gamma"] = self._sample_standard("gamma")
 
-        # --- Vectorized GP factor guide ---
+        # --- Vectorized GP factor guide: 2 sample sites per group ---
         for g_idx, (mask_bool, group_pats) in enumerate(self.model.mask_groups):
             group_pats = group_pats.to(self.model.device)
             n_t = mask_bool.sum().item()
@@ -542,24 +538,23 @@ class TemporalGuide(PyroModule):
 
             group_plate = pyro.plate(f"group_{g_idx}", n_group, dim=-1)
 
-            for k in range(self.model.n_factors):
-                # f guide: diagonal Normal -> MVN-like via to_event(1)
-                mu_f = self.z_mean[group_pats, k, :n_t]  # (n_group, T)
-                s_f = self.z_scale[group_pats, k, :n_t]   # (n_group, T)
-                with group_plate:
-                    pyro.sample(
-                        f"f_g{g_idx}_k{k}",
-                        dist.Normal(mu_f, s_f).to_event(1),
-                    )
+            # f guide: (n_group, K, T) — matches model's reparameterized eps
+            mu_f = self.z_mean[group_pats, :, :n_t]   # (n_group, K, T)
+            s_f = self.z_scale[group_pats, :, :n_t]    # (n_group, K, T)
+            with group_plate:
+                pyro.sample(
+                    f"f_g{g_idx}",
+                    dist.Normal(mu_f, s_f).to_event(2),
+                )
 
-                # eta guide: diagonal Normal
-                mu_e = self.eta_mean[group_pats, k, :n_t]
-                s_e = self.eta_scale[group_pats, k, :n_t]
-                with group_plate:
-                    pyro.sample(
-                        f"eta_g{g_idx}_k{k}",
-                        dist.Normal(mu_e, s_e).to_event(1),
-                    )
+            # eta guide: (n_group, K, T)
+            mu_e = self.eta_mean[group_pats, :, :n_t]
+            s_e = self.eta_scale[group_pats, :, :n_t]
+            with group_plate:
+                pyro.sample(
+                    f"eta_g{g_idx}",
+                    dist.Normal(mu_e, s_e).to_event(2),
+                )
 
         return output_dict
 
