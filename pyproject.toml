@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "tpacmon"
+version = "0.1.0"
+description = "Temporal Bayesian Latent Factor Model with GP priors and gene-set informed horseshoe"
+authors = ["Sebastian Wolf"]
+readme = "README.md"
+packages = [{include = "tpacmon"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+torch = "^2.5.1"
+pyro-ppl = "^1.9.1"
+scikit-learn = "^1.6.0"
+scipy = "^1.14.1"
+pandas = "^2.2.3"
+numpy = ">=1.24"
+tqdm = "^4.66"
+seaborn = "^0.13"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "^5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
