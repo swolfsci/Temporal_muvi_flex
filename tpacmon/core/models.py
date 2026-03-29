@@ -788,9 +788,10 @@ class TemporalPACMON:
         for epoch in pbar:
             loss = svi.step(obs, obs_mask, patient_idx, time_idx, covs)
 
-            # Gradient clipping
+            # Gradient clipping (only leaf tensors to avoid PyTorch warning)
             if clip_norm > 0:
-                params = [p for p in pyro.get_param_store().values() if p.requires_grad]
+                params = [p for p in pyro.get_param_store().values()
+                          if p.requires_grad and p.is_leaf and p.grad is not None]
                 if params:
                     torch.nn.utils.clip_grad_norm_(params, clip_norm)
 
