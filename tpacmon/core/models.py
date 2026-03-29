@@ -574,6 +574,7 @@ class TemporalPACMON:
         n_sparse_factors: Optional[int] = None,
         n_dense_factors: Optional[int] = None,
         kernel: str = "matern32",
+        feature_names: Optional[Dict[str, list]] = None,
         likelihoods: Optional[Dict[str, str]] = None,
         normalize: bool = True,
         shared_lengthscale: bool = False,
@@ -604,6 +605,9 @@ class TemporalPACMON:
         # Setup observations
         self.view_names = list(observations.keys())
         self.observations, self.feature_names = self._setup_observations(observations)
+        if feature_names is not None:
+            for vn, names in feature_names.items():
+                self.feature_names[vn] = names
         self.n_features = {vn: obs.shape[-1] for vn, obs in self.observations.items()}
 
         # Setup covariates
@@ -613,8 +617,14 @@ class TemporalPACMON:
             self.covariates = np.asarray(covariates, dtype=np.float32)
             self.n_covariates = self.covariates.shape[1]
 
-        # Setup priors
+        # Setup priors — save factor names before conversion strips them
         self.prior_confidence = self._setup_prior_confidence(prior_confidence)
+        _prior_mask_names = None
+        if prior_masks is not None:
+            vn0 = self.view_names[0]
+            if vn0 in prior_masks and isinstance(prior_masks[vn0], pd.DataFrame):
+                _prior_mask_names = prior_masks[vn0].index.tolist()
+
         self.prior_masks, self.prior_scales = self._setup_prior_masks(
             prior_masks, n_sparse_factors
         )
@@ -626,12 +636,10 @@ class TemporalPACMON:
 
         # Factor naming
         factor_names = []
-        if self.prior_masks is not None:
-            vn0 = self.view_names[0]
-            if isinstance(self.prior_masks[vn0], pd.DataFrame):
-                factor_names.extend(self.prior_masks[vn0].index.tolist())
-            else:
-                factor_names.extend([f"sparse_{k}" for k in range(self.n_sparse_factors)])
+        if _prior_mask_names is not None:
+            factor_names.extend(_prior_mask_names)
+        elif self.n_sparse_factors > 0:
+            factor_names.extend([f"sparse_{k}" for k in range(self.n_sparse_factors)])
         factor_names.extend([f"dense_{k}" for k in range(self.n_dense_factors)])
         self.factor_names = factor_names
 
