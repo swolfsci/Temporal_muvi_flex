@@ -2,8 +2,7 @@
 
 import logging
 import math
-from functools import partial
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -27,8 +26,25 @@ SingleView = Union[np.ndarray, pd.DataFrame]
 MultiView = Union[Dict[str, SingleView], List[SingleView]]
 
 
+def _group_patients_by_mask(patient_masks: torch.Tensor):
+    """Group patients that share the same observation mask.
+
+    Returns list of (mask_bool, patient_indices) tuples.
+    With 4 timepoints there are at most 16 possible patterns.
+    """
+    groups = {}
+    for p in range(patient_masks.shape[0]):
+        key = tuple(patient_masks[p].bool().tolist())
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(p)
+    return [(torch.tensor(list(k), dtype=torch.bool),
+             torch.tensor(v, dtype=torch.long))
+            for k, v in groups.items()]
+
+
 # ---------------------------------------------------------------------------
-# TemporalModel — generative model
+# TemporalModel — generative model (vectorized)
 # ---------------------------------------------------------------------------
 class TemporalModel(PyroModule):
     def __init__(
@@ -65,9 +81,11 @@ class TemporalModel(PyroModule):
         self.time_points = time_points.to(device)
         self.patient_masks = patient_masks.to(device)
         self.n_timepoints = time_points.shape[0]
-        # Per-patient observed counts
         self.n_obs_per_patient = patient_masks.sum(dim=1).long()
         self.max_obs = int(self.n_obs_per_patient.max().item())
+
+        # Pre-compute patient groups by mask pattern
+        self.mask_groups = _group_patients_by_mask(patient_masks)
 
         # Prior scales
         self.prior_scales = prior_scales
@@ -94,7 +112,6 @@ class TemporalModel(PyroModule):
             raw_weights = np.array([1.0 / (nf ** alpha) for nf in n_features])
             self.view_scales = self.n_views * raw_weights / raw_weights.sum()
 
-        # Total number of observation rows (patients * their observed timepoints)
         self.n_obs_total = int(self.n_obs_per_patient.sum().item())
 
     def _zeros(self, size):
@@ -205,56 +222,80 @@ class TemporalModel(PyroModule):
                         "gamma", dist.Normal(self._zeros((1,)), self._ones((1,)))
                     )
 
-        # --- Sample z per patient via GP prior ---
-        # Build z for all observations: shape (n_obs,) indexes into patients/times
+        # --- Vectorized GP sampling per mask group ---
+        # Instead of P*K individual samples, we sample per group:
+        # one MVN sample per group with shape (n_group_patients, K, T_obs)
         z_all = self._zeros((n_obs, self.n_factors))
 
         lengthscales = output_dict["lengthscale"].squeeze()
         amplitudes = output_dict["amplitude"].squeeze()
         zetas = output_dict["zeta"].squeeze()
 
-        # Unique patients in this batch
-        unique_patients = torch.unique(patient_idx)
-
-        for p in unique_patients:
-            p = p.item()
-            mask_p = self.patient_masks[p].bool()
-            t_obs = self.time_points[mask_p]
+        for g_idx, (mask_bool, group_pats) in enumerate(self.mask_groups):
+            mask_bool = mask_bool.to(self.device)
+            group_pats = group_pats.to(self.device)
+            t_obs = self.time_points[mask_bool]
             n_t = t_obs.shape[0]
+            n_group = group_pats.shape[0]
 
-            # Which rows in the obs tensor belong to this patient
-            obs_rows = (patient_idx == p).nonzero(as_tuple=True)[0]
+            # Build kernel matrices for all factors at once: (K, T, T)
+            K_all = torch.stack([
+                build_kernel(
+                    self.kernel_name, t_obs,
+                    lengthscales[k] if self.n_factors > 1 else lengthscales,
+                    amplitudes[k] if self.n_factors > 1 else amplitudes,
+                    jitter=1e-5,
+                )
+                for k in range(self.n_factors)
+            ])  # (K, T, T)
+
+            # GP mean per patient per factor: (n_group, K, T)
+            if self.n_covariates > 0 and covs is not None:
+                # covs: (P, C), gamma: (C, K) -> gp_means: (n_group, K)
+                gp_means_scalar = covs[group_pats] @ output_dict["gamma"]  # (n_group, K)
+                gp_means = gp_means_scalar.unsqueeze(-1).expand(n_group, self.n_factors, n_t)
+            else:
+                gp_means = self._zeros((n_group, self.n_factors, n_t))
+
+            # Sample f: one batched MVN per factor across all group patients
+            # Shape: (n_group, K, T)
+            f_group = self._zeros((n_group, self.n_factors, n_t))
+            eta_group = self._zeros((n_group, self.n_factors, n_t))
+
+            group_plate = pyro.plate(f"group_{g_idx}", n_group, dim=-1)
 
             for k in range(self.n_factors):
-                ls_k = lengthscales[k] if self.n_factors > 1 else lengthscales
-                amp_k = amplitudes[k] if self.n_factors > 1 else amplitudes
-                zeta_k = zetas[k] if self.n_factors > 1 else zetas
-
-                # GP mean (covariate-shifted)
-                if self.n_covariates > 0 and covs is not None:
-                    gp_mean = (covs[p] @ output_dict["gamma"][:, k]).expand(n_t)
-                else:
-                    gp_mean = self._zeros((n_t,))
-
-                # Build kernel
-                K = build_kernel(self.kernel_name, t_obs, ls_k, amp_k, jitter=1e-5)
-
-                # GP component
+                # Batched MVN: all patients in group share same kernel
                 with pyro.poutine.scale(scale=self.gp_scale):
-                    f_pk = pyro.sample(
-                        f"f_{p}_{k}",
-                        dist.MultivariateNormal(gp_mean, covariance_matrix=K)
-                    )
+                    with group_plate:
+                        f_k = pyro.sample(
+                            f"f_g{g_idx}_k{k}",
+                            dist.MultivariateNormal(
+                                gp_means[:, k, :],  # (n_group, T)
+                                covariance_matrix=K_all[k],  # (T, T) broadcast
+                            ),
+                        )  # (n_group, T)
+                f_group[:, k, :] = f_k
 
-                # i.i.d. component
-                eta_pk = pyro.sample(
-                    f"eta_{p}_{k}",
-                    dist.Normal(self._zeros((n_t,)), self._ones((n_t,))).to_event(1)
-                )
+                with group_plate:
+                    eta_k = pyro.sample(
+                        f"eta_g{g_idx}_k{k}",
+                        dist.Normal(
+                            self._zeros((n_group, n_t)),
+                            self._ones((n_group, n_t)),
+                        ).to_event(1),
+                    )  # (n_group, T)
+                eta_group[:, k, :] = eta_k
 
-                # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*eta
-                z_pk = torch.sqrt(1 - zeta_k) * f_pk + torch.sqrt(zeta_k) * eta_pk
-                z_all[obs_rows, k] = z_pk
+            # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*eta
+            zeta_exp = zetas.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
+            z_group = torch.sqrt(1 - zeta_exp) * f_group + torch.sqrt(zeta_exp) * eta_group
+            # z_group: (n_group, K, T)
+
+            # Scatter into z_all: map group patients to their obs rows
+            for i, p in enumerate(group_pats):
+                obs_rows = (patient_idx == p).nonzero(as_tuple=True)[0]
+                z_all[obs_rows, :] = z_group[i, :, :len(obs_rows)].T
 
         output_dict["z"] = z_all
 
@@ -265,7 +306,6 @@ class TemporalModel(PyroModule):
                 with feature_plates[m]:
                     y_loc = torch.matmul(z_all, output_dict[f"w_{m}"])
                     if self.n_covariates > 0 and covs is not None:
-                        # Expand covs to match obs rows (covs indexed by patient)
                         covs_expanded = covs[patient_idx]
                         y_loc = y_loc + torch.matmul(covs_expanded, output_dict[f"beta_{m}"])
 
@@ -287,7 +327,7 @@ class TemporalModel(PyroModule):
 
 
 # ---------------------------------------------------------------------------
-# TemporalGuide — variational posterior
+# TemporalGuide — variational posterior (vectorized, diagonal)
 # ---------------------------------------------------------------------------
 class TemporalGuide(PyroModule):
     def __init__(self, model: TemporalModel, init_loc: float = 0.0, init_scale: float = 0.1):
@@ -307,8 +347,9 @@ class TemporalGuide(PyroModule):
         n_features = self.model.n_features
         n_covariates = self.model.n_covariates
         n_patients = self.model.n_patients
+        max_obs = self.model.max_obs
 
-        # --- Standard sites (same as PACMon) ---
+        # --- Standard sites ---
         site_to_shape = {
             "view_scale": (n_views,),
             "factor_scale": (n_informed, n_views),
@@ -339,13 +380,11 @@ class TemporalGuide(PyroModule):
             k: "Normal" if k in normal_sites else "LogNormal"
             for k in site_to_shape
         }
-        # zeta uses Beta — handle separately
         site_to_dist["zeta"] = "Beta"
 
         # Register standard params
         for name, shape in site_to_shape.items():
             if name == "zeta":
-                # Beta guide: parameterize via concentration
                 setattr(self.locs, name, PyroParam(
                     2.0 * self.model._ones(shape), constraints.positive
                 ))
@@ -360,28 +399,23 @@ class TemporalGuide(PyroModule):
                     self.init_scale * self.model._ones(shape), constraints.positive
                 ))
 
-        # --- Per-patient per-factor GP guide parameters ---
-        # f_{p}_{k} gets MVN guide with learned mean + Cholesky
-        # We store padded tensors: (n_patients, max_obs, n_factors) for means
-        # and (n_patients, max_obs, max_obs, n_factors) for Cholesky factors
-        max_obs = self.model.max_obs
+        # --- GP factor guide: diagonal Normal, stored as (P, K, T_max) ---
+        # Much more memory-efficient than per-patient Cholesky
         self.z_mean = PyroParam(
-            torch.zeros(n_patients, max_obs, n_factors, device=self.model.device),
+            torch.zeros(n_patients, n_factors, max_obs, device=self.model.device),
             constraints.real,
         )
-        self.z_scale_tril = PyroParam(
-            0.1 * torch.eye(max_obs, device=self.model.device).unsqueeze(0).unsqueeze(-1).expand(
-                n_patients, max_obs, max_obs, n_factors
-            ).clone(),
-            constraints.real,  # We'll construct L @ L^T manually
+        self.z_scale = PyroParam(
+            0.1 * torch.ones(n_patients, n_factors, max_obs, device=self.model.device),
+            constraints.positive,
         )
-        # eta_{p}_{k} gets diagonal Normal guide
+        # eta guide: also diagonal Normal (P, K, T_max)
         self.eta_mean = PyroParam(
-            torch.zeros(n_patients, max_obs, n_factors, device=self.model.device),
+            torch.zeros(n_patients, n_factors, max_obs, device=self.model.device),
             constraints.real,
         )
         self.eta_scale = PyroParam(
-            0.1 * torch.ones(n_patients, max_obs, n_factors, device=self.model.device),
+            0.1 * torch.ones(n_patients, n_factors, max_obs, device=self.model.device),
             constraints.positive,
         )
 
@@ -446,7 +480,8 @@ class TemporalGuide(PyroModule):
 
     def get_z(self):
         """Return factor scores as (n_patients, max_obs, n_factors) numpy array."""
-        return self.z_mean.detach().cpu().numpy()
+        # stored as (P, K, T) -> transpose to (P, T, K)
+        return self.z_mean.detach().permute(0, 2, 1).cpu().numpy()
 
     def forward(self, obs, obs_mask, patient_idx, time_idx, covs=None):
         output_dict = {}
@@ -499,31 +534,32 @@ class TemporalGuide(PyroModule):
                 with gamma_plate_fac:
                     output_dict["gamma"] = self._sample_standard("gamma")
 
-        # --- Per-patient GP factors (structured MVN guide) ---
-        unique_patients = torch.unique(patient_idx)
-        for p in unique_patients:
-            p_int = p.item()
-            n_t = self.model.n_obs_per_patient[p_int].item()
+        # --- Vectorized GP factor guide ---
+        for g_idx, (mask_bool, group_pats) in enumerate(self.model.mask_groups):
+            group_pats = group_pats.to(self.model.device)
+            n_t = mask_bool.sum().item()
+            n_group = group_pats.shape[0]
+
+            group_plate = pyro.plate(f"group_{g_idx}", n_group, dim=-1)
 
             for k in range(self.model.n_factors):
-                # f_{p}_{k}: MVN with learned Cholesky
-                mu = self.z_mean[p_int, :n_t, k]
-                L_raw = self.z_scale_tril[p_int, :n_t, :n_t, k]
-                L = torch.tril(L_raw)
-                # Ensure positive diagonal
-                L = L - torch.diag(torch.diag(L)) + torch.diag(torch.diag(L).abs().clamp(min=1e-6))
-                pyro.sample(
-                    f"f_{p_int}_{k}",
-                    dist.MultivariateNormal(mu, scale_tril=L)
-                )
+                # f guide: diagonal Normal -> MVN-like via to_event(1)
+                mu_f = self.z_mean[group_pats, k, :n_t]  # (n_group, T)
+                s_f = self.z_scale[group_pats, k, :n_t]   # (n_group, T)
+                with group_plate:
+                    pyro.sample(
+                        f"f_g{g_idx}_k{k}",
+                        dist.Normal(mu_f, s_f).to_event(1),
+                    )
 
-                # eta_{p}_{k}: diagonal Normal
-                eta_mu = self.eta_mean[p_int, :n_t, k]
-                eta_s = self.eta_scale[p_int, :n_t, k]
-                pyro.sample(
-                    f"eta_{p_int}_{k}",
-                    dist.Normal(eta_mu, eta_s).to_event(1)
-                )
+                # eta guide: diagonal Normal
+                mu_e = self.eta_mean[group_pats, k, :n_t]
+                s_e = self.eta_scale[group_pats, k, :n_t]
+                with group_plate:
+                    pyro.sample(
+                        f"eta_g{g_idx}_k{k}",
+                        dist.Normal(mu_e, s_e).to_event(1),
+                    )
 
         return output_dict
 
@@ -546,7 +582,7 @@ class TemporalPACMON:
         likelihoods: Optional[Dict[str, str]] = None,
         normalize: bool = True,
         shared_lengthscale: bool = False,
-        guide_type: str = "cholesky",
+        guide_type: str = "diagonal",
         gp_scale: float = 1.0,
         double_precision: bool = False,
         device: str = "auto",
@@ -626,12 +662,9 @@ class TemporalPACMON:
             else:
                 arr = np.asarray(obs, dtype=np.float32)
                 feature_names[vn] = [f"{vn}_{j}" for j in range(arr.shape[-1])]
-            # Expect shape (P, T, D) or (P, D) for non-temporal
             if arr.ndim == 2:
-                # Expand: (P, D) -> (P, 1, D) assuming single timepoint
                 arr = arr[:, np.newaxis, :]
             if self.normalize:
-                # Normalize per feature across all non-NaN observations
                 reshaped = arr.reshape(-1, arr.shape[-1])
                 col_mean = np.nanmean(reshaped, axis=0)
                 col_std = np.nanstd(reshaped, axis=0)
@@ -654,7 +687,6 @@ class TemporalPACMON:
         if masks is None:
             return None, None
 
-        # Convert to numpy arrays
         processed = {}
         for vn in self.view_names:
             if vn in masks:
@@ -664,18 +696,15 @@ class TemporalPACMON:
                 else:
                     processed[vn] = np.asarray(m, dtype=np.float32)
             else:
-                # Uninformed view
                 n_factors = next(iter(masks.values())).shape[0] if isinstance(next(iter(masks.values())), (np.ndarray, pd.DataFrame)) else 0
                 processed[vn] = np.zeros((n_factors, self.n_features[vn]), dtype=np.float32)
 
-        # Compute prior scales: clip(mask + (1 - confidence), 1e-8, 1.0)
         prior_scales = {}
         for vn, vm in processed.items():
             prior_scales[vn] = np.clip(
                 vm.astype(np.float32) + (1.0 - self.prior_confidence), 1e-8, 1.0
             )
 
-        # Concatenate across views for the model
         scales_list = [torch.tensor(prior_scales[vn]) for vn in self.view_names]
         scales_cat = torch.cat(scales_list, dim=1)
 
@@ -808,7 +837,6 @@ class TemporalPACMON:
     def get_factors(self, as_df: bool = False):
         """Return factor scores as (P, T_max, K) array. NaN for unobserved."""
         z = self._guide.get_z()  # (P, max_obs, K)
-        # Expand to full grid
         result = np.full((self.n_patients, self.n_timepoints, self.n_factors), np.nan)
         for p in range(self.n_patients):
             obs_idx = np.where(self.patient_masks_np[p])[0]
@@ -851,17 +879,14 @@ class TemporalPACMON:
         return {vn: betas[i] for i, vn in enumerate(self.view_names)}
 
     def predict(self, new_time_points: np.ndarray):
-        """GP posterior prediction at unobserved times.
-
-        Returns dict with 'mean' (P, T_new, K) and 'variance' (P, T_new, K).
-        """
+        """GP posterior prediction at unobserved times."""
         if not self._trained:
             raise RuntimeError("Model must be trained before prediction.")
 
         new_t = torch.tensor(new_time_points, dtype=torch.float32, device=self.device)
         lengthscales = torch.tensor(self._guide.get_lengthscales(), dtype=torch.float32, device=self.device)
         amplitudes = torch.tensor(self._guide.get_amplitudes(), dtype=torch.float32, device=self.device)
-        z_means = self._guide.z_mean.detach()  # (P, max_obs, K)
+        z_means = self._guide.z_mean.detach()  # (P, K, T)
 
         time_t = torch.tensor(self.time_points_np, dtype=torch.float32, device=self.device)
 
@@ -883,7 +908,7 @@ class TemporalPACMON:
                     K_new = build_kernel(self.kernel, new_t, ls_k, amp_k, jitter=1e-5)
 
                     K_inv = torch.linalg.solve(K_obs, torch.eye(n_obs, device=self.device))
-                    z_obs = z_means[p, :n_obs, k]
+                    z_obs = z_means[p, k, :n_obs]  # (P, K, T) indexing
 
                     mu_pred = K_new_obs @ K_inv @ z_obs
                     var_pred = torch.diag(K_new - K_new_obs @ K_inv @ K_new_obs.T).clamp(min=0)
