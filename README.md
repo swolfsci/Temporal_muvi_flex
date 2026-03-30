@@ -125,22 +125,46 @@ loaded = EnrichmentResult.load("enrichment.pkl")
 
 ### Metadata Handling
 
+Feature, sample, and covariate names are preserved throughout the model and appear in all outputs (`get_loadings()`, `get_factors()`, `enrich_factors()`, `save()`/`load()`).
+
+**Option 1 — Pass DataFrames (recommended).** Names are inferred automatically:
+
 ```python
 import pandas as pd
 
-# Covariates as DataFrame — column names become covariate_names automatically
-covs_df = pd.DataFrame({"sex": [0, 1, 0], "treatment": [1, 0, 1]})
+# Observations: column names → feature_names, index of first view → sample_names
+obs = {
+    "rna": pd.DataFrame(rna_matrix, columns=gene_names, index=patient_ids),
+    "prot": pd.DataFrame(prot_matrix, columns=protein_names),
+}
+
+# Covariates: column names → covariate_names
+covs = pd.DataFrame({"sex": [0, 1, 0], "treatment": [1, 0, 1]})
+
 model = TemporalPACMON(
-    observations=obs,
-    time_points=tp,
-    patient_masks=masks,
-    covariates=covs_df,                      # DataFrame accepted directly
-    sample_names=["patient_A", "patient_B", "patient_C"],
+    observations=obs, covariates=covs,
+    time_points=tp, patient_masks=masks, n_dense_factors=2,
+)
+model.feature_names   # {"rna": gene_names, "prot": protein_names}
+model.sample_names    # patient_ids (from rna DataFrame index)
+model.covariate_names # ["sex", "treatment"]
+```
+
+**Option 2 — Pass names explicitly** (overrides any inferred names):
+
+```python
+model = TemporalPACMON(
+    observations={"rna": numpy_array},
+    time_points=tp, patient_masks=masks,
+    covariates=cov_array,
+    sample_names=["pat_A", "pat_B", "pat_C"],
+    feature_names={"rna": gene_list},
+    covariate_names=["sex", "treatment"],
     n_dense_factors=2,
 )
-print(model.sample_names)      # ["patient_A", "patient_B", "patient_C"]
-print(model.covariate_names)   # ["sex", "treatment"]
 ```
+
+> If neither DataFrames nor explicit names are provided, defaults are generated automatically (`sample_0`, `rna_0`, `cov_0`, ...).
 
 ### Model Serialization
 
