@@ -37,6 +37,58 @@ class EnrichmentResult:
     covariate: Optional[pd.DataFrame] = None
     covariate_summary: Optional[pd.DataFrame] = None
 
+    _FIELDS = ("fidelity", "enrichment", "temporal", "covariate", "covariate_summary")
+
+    def to_dict(self) -> Dict[str, pd.DataFrame]:
+        """Return non-None results as a dict of DataFrames."""
+        return {k: getattr(self, k) for k in self._FIELDS if getattr(self, k) is not None}
+
+    def save(self, path: str) -> None:
+        """Save enrichment results to disk.
+
+        Args:
+            path: File path (e.g., "enrichment.pt" or "enrichment.pkl").
+        """
+        import pickle
+        data = {k: df.to_dict(orient="split") for k, df in self.to_dict().items()}
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info("Enrichment results saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str) -> "EnrichmentResult":
+        """Load enrichment results from disk.
+
+        Args:
+            path: Path to saved enrichment file.
+
+        Returns:
+            EnrichmentResult with restored DataFrames.
+        """
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        kwargs = {}
+        for key, split_dict in data.items():
+            kwargs[key] = pd.DataFrame(**split_dict)
+        return cls(**kwargs)
+
+    def to_json(self, path: str) -> None:
+        """Export enrichment results as JSON (for web consumption).
+
+        Args:
+            path: File path (e.g., "enrichment.json").
+        """
+        import json
+        data = {}
+        for key, df in self.to_dict().items():
+            # Reset index so it becomes a column, then orient='records'
+            df_reset = df.reset_index() if df.index.name or not isinstance(df.index, pd.RangeIndex) else df
+            data[key] = json.loads(df_reset.to_json(orient="records", double_precision=6))
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Enrichment results exported to %s", path)
+
 
 def enrich_factors(
     model,

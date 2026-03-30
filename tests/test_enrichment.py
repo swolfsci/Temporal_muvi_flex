@@ -1,6 +1,7 @@
 """Tests for post-hoc enrichment analysis."""
 
 import numpy as np
+import pandas as pd
 import pytest
 from unittest.mock import MagicMock
 
@@ -419,3 +420,67 @@ class TestEnrichFactors:
         result = enrich_factors(model)
         assert result.covariate is None
         assert result.covariate_summary is None
+
+
+# ---------------------------------------------------------------------------
+# Test EnrichmentResult serialization
+# ---------------------------------------------------------------------------
+
+class TestEnrichmentResultSerialization:
+    def _make_result(self):
+        """Create an EnrichmentResult with all fields populated."""
+        model = _make_mock_model(n_patients=10, n_timepoints=4, n_factors=2,
+                                  n_sparse_factors=1, n_features=50, n_covariates=1)
+        prior_mask = np.zeros((1, 50), dtype=np.float32)
+        prior_mask[0, :10] = 1.0
+        model.prior_masks = {"view_0": prior_mask}
+        covs = np.zeros((10, 1), dtype=np.float32)
+        covs[:5, 0] = 0.0
+        covs[5:, 0] = 1.0
+        model.covariates = covs
+        model._guide.mode.return_value = np.array([[0.5, 0.3]], dtype=np.float32)
+
+        return enrich_factors(
+            model,
+            covariate_names=["treatment"],
+            covariate_types={"treatment": "categorical"},
+        )
+
+    def test_to_dict(self):
+        result = self._make_result()
+        d = result.to_dict()
+        assert "temporal" in d
+        assert "fidelity" in d
+        assert "covariate" in d
+        assert "covariate_summary" in d
+        # enrichment not computed (no gene sets)
+        assert "enrichment" not in d
+
+    def test_save_load_roundtrip(self, tmp_path):
+        result = self._make_result()
+        path = str(tmp_path / "enrichment.pkl")
+        result.save(path)
+        loaded = EnrichmentResult.load(path)
+
+        # Temporal
+        pd.testing.assert_frame_equal(result.temporal, loaded.temporal, check_dtype=False)
+        # Fidelity
+        pd.testing.assert_frame_equal(result.fidelity, loaded.fidelity, check_dtype=False)
+        # Covariate
+        pd.testing.assert_frame_equal(result.covariate, loaded.covariate, check_dtype=False)
+        pd.testing.assert_frame_equal(result.covariate_summary, loaded.covariate_summary, check_dtype=False)
+        # Enrichment was None
+        assert loaded.enrichment is None
+
+    def test_to_json(self, tmp_path):
+        import json
+        result = self._make_result()
+        path = str(tmp_path / "enrichment.json")
+        result.to_json(path)
+
+        with open(path) as f:
+            data = json.load(f)
+        assert "temporal" in data
+        assert "fidelity" in data
+        assert isinstance(data["temporal"], list)
+        assert len(data["temporal"]) == 2  # 2 factors
