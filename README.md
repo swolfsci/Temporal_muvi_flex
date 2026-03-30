@@ -82,7 +82,54 @@ model = TemporalPACMON(
 )
 ```
 
-### Predictive Signatures
+### Post-hoc Enrichment Analysis
+
+```python
+from tpacmon import enrich_factors
+
+# Basic: prior fidelity + temporal metrics (fast)
+result = enrich_factors(model)
+print(result.fidelity)    # AUROC fidelity, refinement counts, Gini per sparse factor
+print(result.temporal)    # zeta, temporal_strength, TVR, lengthscale per factor
+
+# With external gene sets (PCGSE competitive enrichment)
+result = enrich_factors(model, gene_sets=gene_sets, view_name="rna")
+print(result.enrichment)  # Wilcoxon p-values, BH-adjusted, AUROC, prior_rank
+
+# With covariate analysis (temporal divergence, TIR)
+result = enrich_factors(
+    model,
+    covariate_names=["sex", "treatment"],
+    covariate_types={"sex": "categorical", "treatment": "categorical"},
+)
+print(result.covariate)          # gamma, TD per (factor, covariate)
+print(result.covariate_summary)  # TIR per covariate (static vs. dynamic classifier)
+
+# Optionally include ElasticNet predictive signatures (slow)
+result = enrich_factors(model, compute_signatures=True)
+print(result.signatures)         # {factor_name: DataFrame of top features}
+print(result.signature_scores)   # {factor_name: CV R²}
+
+# Export for downstream tools / webapp
+result.save("enrichment.pkl")            # pickle round-trip
+result.to_json("enrichment.json")        # JSON for web consumption
+loaded = EnrichmentResult.load("enrichment.pkl")
+```
+
+### Model Serialization
+
+```python
+# Save trained model (observations are NOT saved)
+model.save("trained_model.pt")
+
+# Load — all get_* methods work immediately
+model = TemporalPACMON.load("trained_model.pt")
+z = model.get_factors()
+w = model.get_loadings()
+pred = model.predict(new_time_points=[0.5, 2.0, 5.0])
+```
+
+### Predictive Signatures (standalone)
 
 ```python
 from tpacmon.tools.signatures import compute_predictive_signatures
@@ -201,7 +248,7 @@ temporal_pacmon/
 ├── tpacmon/
 │   ├── __init__.py
 │   ├── core/
-│   │   ├── models.py          # TemporalModel, TemporalGuide, TemporalPACMON
+│   │   ├── models.py          # TemporalModel, TemporalGuide, TemporalPACMON (+ save/load)
 │   │   ├── kernels.py         # Matern 3/2, Matern 5/2, RBF kernels
 │   │   ├── callbacks.py       # Checkpoint callback
 │   │   ├── early_stopping.py  # Early stopping callback
@@ -209,8 +256,9 @@ temporal_pacmon/
 │   └── tools/
 │       ├── feature_sets.py    # FeatureSet/FeatureSets classes, GMT I/O
 │       ├── gene_set_prep.py   # Size filtering + Jaccard hierarchical merging
-│       └── signatures.py      # ElasticNet predictive signatures
-├── tests/                     # 52 tests
+│       ├── signatures.py      # ElasticNet predictive signatures
+│       └── enrichment.py      # Post-hoc enrichment analysis (enrich_factors)
+├── tests/                     # 84 tests
 ├── pyproject.toml
 └── README.md
 ```
@@ -235,7 +283,7 @@ temporal_pacmon/
 ## Testing
 
 ```bash
-# Run all tests (52 tests)
+# Run all tests (84 tests)
 pytest tests/ -v
 
 # Run fast tests only (exclude SVI smoke tests)
