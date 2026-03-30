@@ -30,27 +30,49 @@ class EnrichmentResult:
             Columns: factor, covariate, gamma, TD.
         covariate_summary: Covariate-level summary.
             Index: covariate names. Columns: TIR.
+        signatures: Predictive signatures per factor (ElasticNet).
+            Dict of {factor_name: DataFrame with feature, coefficient, abs_coefficient}.
+            None unless compute_signatures=True.
+        signature_scores: CV R² per factor for signature models.
+            Dict of {factor_name: float}. None unless compute_signatures=True.
     """
     fidelity: Optional[pd.DataFrame] = None
     enrichment: Optional[pd.DataFrame] = None
     temporal: Optional[pd.DataFrame] = None
     covariate: Optional[pd.DataFrame] = None
     covariate_summary: Optional[pd.DataFrame] = None
+    signatures: Optional[Dict[str, pd.DataFrame]] = None
+    signature_scores: Optional[Dict[str, float]] = None
 
     _FIELDS = ("fidelity", "enrichment", "temporal", "covariate", "covariate_summary")
 
-    def to_dict(self) -> Dict[str, pd.DataFrame]:
-        """Return non-None results as a dict of DataFrames."""
-        return {k: getattr(self, k) for k in self._FIELDS if getattr(self, k) is not None}
+    def to_dict(self) -> dict:
+        """Return non-None results as a dict of DataFrames/dicts."""
+        out = {k: getattr(self, k) for k in self._FIELDS if getattr(self, k) is not None}
+        if self.signatures is not None:
+            out["signatures"] = self.signatures
+        if self.signature_scores is not None:
+            out["signature_scores"] = self.signature_scores
+        return out
 
     def save(self, path: str) -> None:
         """Save enrichment results to disk.
 
         Args:
-            path: File path (e.g., "enrichment.pt" or "enrichment.pkl").
+            path: File path (e.g., "enrichment.pkl").
         """
         import pickle
-        data = {k: df.to_dict(orient="split") for k, df in self.to_dict().items()}
+        data = {}
+        for k in self._FIELDS:
+            v = getattr(self, k)
+            if v is not None:
+                data[k] = v.to_dict(orient="split")
+        if self.signatures is not None:
+            data["signatures"] = {
+                name: df.to_dict(orient="split") for name, df in self.signatures.items()
+            }
+        if self.signature_scores is not None:
+            data["signature_scores"] = self.signature_scores
         with open(path, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
         logger.info("Enrichment results saved to %s", path)
@@ -69,8 +91,16 @@ class EnrichmentResult:
         with open(path, "rb") as f:
             data = pickle.load(f)
         kwargs = {}
-        for key, split_dict in data.items():
-            kwargs[key] = pd.DataFrame(**split_dict)
+        for key, val in data.items():
+            if key == "signatures":
+                kwargs["signatures"] = {
+                    name: pd.DataFrame(**split_dict)
+                    for name, split_dict in val.items()
+                }
+            elif key == "signature_scores":
+                kwargs["signature_scores"] = val
+            else:
+                kwargs[key] = pd.DataFrame(**val)
         return cls(**kwargs)
 
     def to_json(self, path: str) -> None:
@@ -81,10 +111,19 @@ class EnrichmentResult:
         """
         import json
         data = {}
-        for key, df in self.to_dict().items():
-            # Reset index so it becomes a column, then orient='records'
+        for key in self._FIELDS:
+            df = getattr(self, key)
+            if df is None:
+                continue
             df_reset = df.reset_index() if df.index.name or not isinstance(df.index, pd.RangeIndex) else df
             data[key] = json.loads(df_reset.to_json(orient="records", double_precision=6))
+        if self.signatures is not None:
+            data["signatures"] = {
+                name: json.loads(df.to_json(orient="records", double_precision=6))
+                for name, df in self.signatures.items()
+            }
+        if self.signature_scores is not None:
+            data["signature_scores"] = self.signature_scores
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         logger.info("Enrichment results exported to %s", path)
@@ -96,6 +135,8 @@ def enrich_factors(
     view_name: Optional[str] = None,
     covariate_names: Optional[List[str]] = None,
     covariate_types: Optional[Dict[str, str]] = None,
+    compute_signatures: bool = False,
+    signature_kwargs: Optional[dict] = None,
 ) -> EnrichmentResult:
     """Compute post-hoc enrichment analysis for learned latent factors.
 
@@ -106,6 +147,10 @@ def enrich_factors(
         covariate_names: Optional list of covariate names for labeling.
         covariate_types: Optional dict mapping covariate name to
             "categorical" or "continuous". Defaults to "continuous" for all.
+        compute_signatures: If True, run ElasticNet predictive signatures
+            (slow — fits one CV model per factor). Default False.
+        signature_kwargs: Optional kwargs passed to compute_predictive_signatures
+            (e.g., aggregation, n_alphas, cv, max_features).
 
     Returns:
         EnrichmentResult with populated DataFrames.
@@ -138,6 +183,20 @@ def enrich_factors(
         result.covariate, result.covariate_summary = _compute_covariate(
             model, covariate_names, covariate_types
         )
+
+    # Predictive signatures (optional, slow)
+    if compute_signatures:
+        if model.observations is None:
+            logger.warning("Signatures require observation data; skipping (loaded model).")
+        else:
+            from tpacmon.tools.signatures import compute_predictive_signatures
+            logger.info("Computing predictive signatures (ElasticNet CV)...")
+            sig_kwargs = {"view_name": view_name}
+            if signature_kwargs is not None:
+                sig_kwargs.update(signature_kwargs)
+            sig_result = compute_predictive_signatures(model, **sig_kwargs)
+            result.signatures = sig_result["signatures"]
+            result.signature_scores = sig_result["scores"]
 
     return result
 
