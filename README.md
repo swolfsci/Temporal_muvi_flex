@@ -43,9 +43,11 @@ model = TemporalPACMON(
     observations=data["observations"],      # dict of (P, T, D_m) arrays
     time_points=data["time_points"],         # (T,) common time grid
     patient_masks=data["patient_masks"],     # (P, T) boolean mask
-    covariates=data["covariates"],           # (P, C) patient-level covariates
+    covariates=data["covariates"],           # (P, C) patient-level covariates or DataFrame
     n_dense_factors=3,
     kernel="matern32",
+    sample_names=["pat_1", "pat_2", ...],   # optional, auto-generated if omitted
+    covariate_names=["sex", "treatment"],    # optional, inferred from DataFrame columns
 )
 model.fit(n_epochs=1000, learning_rate=0.01)
 
@@ -54,6 +56,11 @@ z = model.get_factors()           # (P, T, K) factor scores
 w = model.get_loadings()          # dict of (K, D_m) per view
 ls = model.get_lengthscales()     # (K,) learned temporal lengthscales
 zeta = model.get_smoothness()     # (K,) temporal vs. i.i.d. per factor
+
+# Variance explained (R² per view)
+ve = model.get_variance_explained()
+print(ve["total"])       # {view_name: R²} total variance explained
+print(ve["per_factor"])  # {view_name: (K,) array} per-factor R²
 
 # Predict at new time points (GP conditional)
 pred = model.predict(new_time_points=[0.5, 2.0, 5.0])
@@ -116,14 +123,37 @@ result.to_json("enrichment.json")        # JSON for web consumption
 loaded = EnrichmentResult.load("enrichment.pkl")
 ```
 
+### Metadata Handling
+
+```python
+import pandas as pd
+
+# Covariates as DataFrame — column names become covariate_names automatically
+covs_df = pd.DataFrame({"sex": [0, 1, 0], "treatment": [1, 0, 1]})
+model = TemporalPACMON(
+    observations=obs,
+    time_points=tp,
+    patient_masks=masks,
+    covariates=covs_df,                      # DataFrame accepted directly
+    sample_names=["patient_A", "patient_B", "patient_C"],
+    n_dense_factors=2,
+)
+print(model.sample_names)      # ["patient_A", "patient_B", "patient_C"]
+print(model.covariate_names)   # ["sex", "treatment"]
+```
+
 ### Model Serialization
 
 ```python
-# Save trained model (observations are NOT saved)
-model.save("trained_model.pt")
+# Save trained model to a directory (3-file format)
+model.save("trained_model/")
+# Creates: metadata.json, params.npz, structure.npz
+
+# Optionally include observation data
+model.save("trained_model/", include_data=True)
 
 # Load — all get_* methods work immediately
-model = TemporalPACMON.load("trained_model.pt")
+model = TemporalPACMON.load("trained_model/")
 z = model.get_factors()
 w = model.get_loadings()
 pred = model.predict(new_time_points=[0.5, 2.0, 5.0])
@@ -216,6 +246,8 @@ All other sites use diagonal Normal/LogNormal/Beta guides.
 | Feature-level covariate regression | None | Guiding variables (auxiliary loss) | `beta_m` (generative) |
 | Smoothness discovery | Scale param | `zeta_k` mixing | `zeta_k ~ Beta(1,1)` per factor |
 | Interpolation/prediction | GP conditional (mean only) | Not documented | `predict()` returns mean + variance |
+| Variance explained | R² per factor | R² per factor | R² per view (total + per-factor) |
+| Serialization | HDF5 | HDF5 | 3-file directory (JSON + NPZ) |
 | Framework | R (mofapy2) | Pyro + GPyTorch | Pyro (no GPyTorch dependency) |
 
 ---
@@ -258,7 +290,7 @@ temporal_pacmon/
 │       ├── gene_set_prep.py   # Size filtering + Jaccard hierarchical merging
 │       ├── signatures.py      # ElasticNet predictive signatures
 │       └── enrichment.py      # Post-hoc enrichment analysis (enrich_factors)
-├── tests/                     # 84 tests
+├── tests/                     # 95 tests
 ├── pyproject.toml
 └── README.md
 ```
@@ -274,6 +306,7 @@ temporal_pacmon/
 | Ragged structure | Common grid + boolean mask | Avoids variable-size tensors; handles irregular visits |
 | Kernel parameters | Learned via SVI | Per-factor lengthscales without grid search |
 | Smoothness parameter | `zeta_k ~ Beta(1,1)` | Auto-discovers temporal vs. i.i.d. factors |
+| Serialization | 3-file directory (metadata.json + params.npz + structure.npz) | Same as PACMon/MuVI pattern; human-readable config, compact params |
 | Gene set preprocessing | Size filter + Jaccard merge | Horseshoe handles the rest — no learning step needed |
 | Signature extraction | ElasticNetCV | L1 sparsity + L2 for correlated features |
 | Framework | Pyro (no GPyTorch) | Consistent with PACMon/MuVI ecosystem |
@@ -283,7 +316,7 @@ temporal_pacmon/
 ## Testing
 
 ```bash
-# Run all tests (84 tests)
+# Run all tests (95 tests)
 pytest tests/ -v
 
 # Run fast tests only (exclude SVI smoke tests)

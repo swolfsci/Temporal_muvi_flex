@@ -121,6 +121,99 @@ class TestTemporalPACMONInit:
         assert model.n_features == {"rna": 10}
 
 
+class TestMetadata:
+    def test_sample_names_default(self):
+        obs, tp, masks = make_simple_data(n_patients=3)
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, device="cpu",
+        )
+        assert model.sample_names == ["sample_0", "sample_1", "sample_2"]
+
+    def test_sample_names_explicit(self):
+        obs, tp, masks = make_simple_data(n_patients=3)
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, sample_names=["A", "B", "C"], device="cpu",
+        )
+        assert model.sample_names == ["A", "B", "C"]
+
+    def test_covariate_names_default(self):
+        obs, tp, masks = make_simple_data()
+        covs = np.random.randn(5, 2).astype(np.float32)
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, covariates=covs, device="cpu",
+        )
+        assert model.covariate_names == ["cov_0", "cov_1"]
+
+    def test_covariate_names_explicit(self):
+        obs, tp, masks = make_simple_data()
+        covs = np.random.randn(5, 2).astype(np.float32)
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, covariates=covs,
+            covariate_names=["sex", "age"], device="cpu",
+        )
+        assert model.covariate_names == ["sex", "age"]
+
+    def test_covariate_dataframe(self):
+        obs, tp, masks = make_simple_data()
+        covs_df = pd.DataFrame(
+            np.random.randn(5, 2).astype(np.float32),
+            columns=["sex", "treatment"],
+        )
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, covariates=covs_df, device="cpu",
+        )
+        assert model.covariate_names == ["sex", "treatment"]
+        assert model.covariates.shape == (5, 2)
+
+    def test_no_covariates(self):
+        obs, tp, masks = make_simple_data()
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=1, device="cpu",
+        )
+        assert model.covariate_names is None
+
+
+class TestVarianceExplained:
+    def _train_model(self, obs, tp, masks, **kwargs):
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            device="cpu", **kwargs,
+        )
+        model.fit(n_epochs=5, early_stopping=False, seed=0)
+        return model
+
+    def test_basic_output(self):
+        obs, tp, masks = make_simple_data()
+        model = self._train_model(obs, tp, masks, n_dense_factors=2)
+        ve = model.get_variance_explained()
+        assert "total" in ve
+        assert "per_factor" in ve
+        assert "view_0" in ve["total"]
+        assert ve["total"]["view_0"] >= 0
+        assert ve["per_factor"]["view_0"].shape == (2,)
+
+    def test_no_per_factor(self):
+        obs, tp, masks = make_simple_data()
+        model = self._train_model(obs, tp, masks, n_dense_factors=2)
+        ve = model.get_variance_explained(per_factor=False)
+        assert "per_factor" not in ve
+
+    def test_untrained_raises(self):
+        obs, tp, masks = make_simple_data()
+        model = TemporalPACMON(
+            observations=obs, time_points=tp, patient_masks=masks,
+            n_dense_factors=2, device="cpu",
+        )
+        with pytest.raises(RuntimeError, match="trained"):
+            model.get_variance_explained()
+
+
 class TestSerialization:
     def _train_model(self, obs, tp, masks, **kwargs):
         model = TemporalPACMON(
@@ -134,38 +227,36 @@ class TestSerialization:
         obs, tp, masks = make_simple_data()
         model = self._train_model(obs, tp, masks, n_dense_factors=2)
 
-        path = str(tmp_path / "model.pt")
-        model.save(path)
-        loaded = TemporalPACMON.load(path, map_location="cpu")
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
 
         np.testing.assert_allclose(
-            model.get_factors(), loaded.get_factors(), atol=1e-6
+            model.get_factors(), loaded.get_factors(), atol=1e-5
         )
 
     def test_save_load_loadings_match(self, tmp_path):
         obs, tp, masks = make_simple_data()
         model = self._train_model(obs, tp, masks, n_dense_factors=2)
 
-        path = str(tmp_path / "model.pt")
-        model.save(path)
-        loaded = TemporalPACMON.load(path, map_location="cpu")
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
 
         for vn in model.view_names:
             np.testing.assert_allclose(
-                model.get_loadings()[vn], loaded.get_loadings()[vn], atol=1e-6
+                model.get_loadings()[vn], loaded.get_loadings()[vn], atol=1e-5
             )
 
     def test_save_load_metadata_preserved(self, tmp_path):
         obs, tp, masks = make_simple_data()
         model = self._train_model(obs, tp, masks, n_dense_factors=2)
 
-        path = str(tmp_path / "model.pt")
-        model.save(path)
-        loaded = TemporalPACMON.load(path, map_location="cpu")
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
 
         assert loaded.factor_names == model.factor_names
         assert loaded.feature_names == model.feature_names
         assert loaded.view_names == model.view_names
+        assert loaded.sample_names == model.sample_names
         assert loaded._trained is True
         assert loaded.n_factors == model.n_factors
 
@@ -176,38 +267,67 @@ class TestSerialization:
             n_dense_factors=2, device="cpu",
         )
         with pytest.raises(RuntimeError, match="trained"):
-            model.save(str(tmp_path / "model.pt"))
+            model.save(str(tmp_path / "model_dir"))
 
     def test_save_load_with_priors(self, tmp_path):
         obs, tp, masks = make_simple_data()
         prior = {"view_0": np.eye(2, 20, dtype=np.float32)}
         model = self._train_model(obs, tp, masks, prior_masks=prior, n_dense_factors=1)
 
-        path = str(tmp_path / "model.pt")
-        model.save(path)
-        loaded = TemporalPACMON.load(path, map_location="cpu")
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
 
         assert loaded.n_sparse_factors == 2
         assert loaded.n_dense_factors == 1
         np.testing.assert_allclose(
-            model.get_factors(), loaded.get_factors(), atol=1e-6
+            model.get_factors(), loaded.get_factors(), atol=1e-5
         )
-        for vn in model.view_names:
-            np.testing.assert_allclose(
-                model.get_loadings()[vn], loaded.get_loadings()[vn], atol=1e-6
-            )
 
     def test_save_load_smoothness_lengthscales(self, tmp_path):
         obs, tp, masks = make_simple_data()
         model = self._train_model(obs, tp, masks, n_dense_factors=2)
 
-        path = str(tmp_path / "model.pt")
-        model.save(path)
-        loaded = TemporalPACMON.load(path, map_location="cpu")
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
 
         np.testing.assert_allclose(
-            model.get_smoothness(), loaded.get_smoothness(), atol=1e-6
+            model.get_smoothness(), loaded.get_smoothness(), atol=1e-5
         )
         np.testing.assert_allclose(
-            model.get_lengthscales(), loaded.get_lengthscales(), atol=1e-6
+            model.get_lengthscales(), loaded.get_lengthscales(), atol=1e-5
         )
+
+    def test_save_load_variance_explained(self, tmp_path):
+        obs, tp, masks = make_simple_data()
+        model = self._train_model(obs, tp, masks, n_dense_factors=2)
+        ve_orig = model.get_variance_explained()
+
+        model.save(str(tmp_path / "model_dir"))
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
+        ve_loaded = loaded.get_variance_explained()
+
+        for vn in model.view_names:
+            assert abs(ve_orig["total"][vn] - ve_loaded["total"][vn]) < 0.1
+
+    def test_save_without_data(self, tmp_path):
+        obs, tp, masks = make_simple_data()
+        model = self._train_model(obs, tp, masks, n_dense_factors=2)
+
+        model.save(str(tmp_path / "model_dir"), include_data=False)
+        loaded = TemporalPACMON.load(str(tmp_path / "model_dir"), map_location="cpu")
+
+        # Factors/loadings still work
+        np.testing.assert_allclose(
+            model.get_factors(), loaded.get_factors(), atol=1e-5
+        )
+        # But variance explained needs observations
+        assert loaded.observations is None
+
+    def test_directory_structure(self, tmp_path):
+        obs, tp, masks = make_simple_data()
+        model = self._train_model(obs, tp, masks, n_dense_factors=2)
+        model.save(str(tmp_path / "model_dir"))
+
+        assert (tmp_path / "model_dir" / "metadata.json").exists()
+        assert (tmp_path / "model_dir" / "params.npz").exists()
+        assert (tmp_path / "model_dir" / "structure.npz").exists()

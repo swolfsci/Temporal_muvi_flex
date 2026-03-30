@@ -457,7 +457,11 @@ def _compute_covariate(
         Tuple of (covariate_df, covariate_summary_df).
     """
     if covariate_names is None:
-        covariate_names = [f"cov_{c}" for c in range(model.n_covariates)]
+        covariate_names = (
+            model.covariate_names
+            if hasattr(model, "covariate_names") and model.covariate_names is not None
+            else [f"cov_{c}" for c in range(model.n_covariates)]
+        )
     if covariate_types is None:
         covariate_types = {name: "continuous" for name in covariate_names}
 
