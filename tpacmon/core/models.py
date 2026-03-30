@@ -921,6 +921,128 @@ class TemporalPACMON:
 
         return {"mean": means, "variance": variances}
 
+    def save(self, path: str) -> None:
+        """Save trained model to disk.
+
+        Saves configuration, learned parameters, and metadata needed to
+        reconstruct the model for inference. Observation data is NOT saved.
+
+        Args:
+            path: File path for the saved model (e.g., "model.pt").
+        """
+        if not self._trained:
+            raise RuntimeError("Model must be trained before saving.")
+
+        import tpacmon
+
+        guide_state = {k: v.cpu() for k, v in self._guide.state_dict().items()}
+
+        checkpoint = {
+            "config": {
+                "view_names": self.view_names,
+                "n_features": self.n_features,
+                "feature_names": self.feature_names,
+                "factor_names": self.factor_names,
+                "n_sparse_factors": self.n_sparse_factors,
+                "n_dense_factors": self.n_dense_factors,
+                "n_patients": self.n_patients,
+                "n_timepoints": self.n_timepoints,
+                "n_covariates": self.n_covariates,
+                "kernel": self.kernel,
+                "likelihoods": self.likelihoods,
+                "prior_confidence": self.prior_confidence,
+                "gp_scale": self.gp_scale,
+                "normalize": self.normalize,
+            },
+            "time_points": self.time_points_np,
+            "patient_masks": self.patient_masks_np,
+            "guide_state": guide_state,
+            "prior_masks": self.prior_masks,
+            "prior_scales": self.prior_scales.cpu() if self.prior_scales is not None else None,
+            "training_history": self._training_history,
+            "tpacmon_version": tpacmon.__version__,
+        }
+        torch.save(checkpoint, path)
+        logger.info(f"Model saved to {path}")
+
+    @classmethod
+    def load(cls, path: str, map_location: Optional[str] = None) -> "TemporalPACMON":
+        """Load a saved model from disk.
+
+        The loaded model supports all read-only operations (get_factors,
+        get_loadings, predict, etc.). Calling fit() requires re-creating
+        the model with observation data.
+
+        Args:
+            path: Path to saved model file.
+            map_location: Device to load tensors to. Default: auto-detect.
+
+        Returns:
+            TemporalPACMON instance with _trained=True.
+        """
+        if map_location is None:
+            map_location = "cuda" if torch.cuda.is_available() else "cpu"
+
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        config = checkpoint["config"]
+
+        # Create instance without __init__ (observations are not saved)
+        instance = object.__new__(cls)
+
+        # Config attributes
+        instance.device = map_location
+        instance.view_names = config["view_names"]
+        instance.n_features = config["n_features"]
+        instance.feature_names = config["feature_names"]
+        instance.factor_names = config["factor_names"]
+        instance.n_sparse_factors = config["n_sparse_factors"]
+        instance.n_dense_factors = config["n_dense_factors"]
+        instance.n_factors = config["n_sparse_factors"] + config["n_dense_factors"]
+        instance.n_patients = config["n_patients"]
+        instance.n_timepoints = config["n_timepoints"]
+        instance.n_covariates = config["n_covariates"]
+        instance.kernel = config["kernel"]
+        instance.likelihoods = config["likelihoods"]
+        instance.prior_confidence = config["prior_confidence"]
+        instance.gp_scale = config["gp_scale"]
+        instance.normalize = config["normalize"]
+        instance.guide_type = "diagonal"
+        instance.double_precision = False
+
+        # Data arrays
+        instance.time_points_np = checkpoint["time_points"]
+        instance.patient_masks_np = checkpoint["patient_masks"]
+
+        # Prior info
+        instance.prior_masks = checkpoint["prior_masks"]
+        instance.prior_scales = checkpoint["prior_scales"]
+        if instance.prior_scales is not None:
+            instance.prior_scales = instance.prior_scales.to(map_location)
+
+        # Training state
+        instance._training_history = checkpoint["training_history"]
+        instance._trained = True
+        instance.observations = None
+        instance.covariates = None
+
+        # Reconstruct model and guide with correct shapes
+        instance._model = None
+        instance._guide = None
+        instance._setup_model_guide()
+
+        # Restore learned parameters
+        guide_state = {
+            k: v.to(map_location) if isinstance(v, torch.Tensor) else v
+            for k, v in checkpoint["guide_state"].items()
+        }
+        instance._guide.load_state_dict(guide_state)
+
+        logger.info(
+            "Model loaded from %s (version %s)",
+            path, checkpoint.get("tpacmon_version", "unknown"),
+        )
+        return instance
+
     @property
     def training_history(self):
         return self._training_history
