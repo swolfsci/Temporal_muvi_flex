@@ -17,11 +17,11 @@ model:
   kernel: matern32
 
 training:
-  n_epochs: 2000
+  n_epochs: 5000
   learning_rate: 0.01
   early_stopping: true
-  patience: 20
-  min_epochs: 100
+  patience: 100
+  min_epochs: 500
 
 sweep:
   noise_std: [0.1, 0.3, 0.5, 1.0, 2.0]
