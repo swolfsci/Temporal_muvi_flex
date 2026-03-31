@@ -36,10 +36,8 @@ print(f"\n=== Factor score correlation ===")
 print(f"  Mean: {corr['mean']:.3f}")
 print(f"  Per factor: {[f'{x:.3f}' for x in corr['per_factor']]}")
 
-print(f"\n=== R² per view ===")
-learned_w = model.get_loadings()
+print(f"\n=== R² per view (model's own method, handles normalization) ===")
+r2_result = model.get_variance_explained(per_factor=True)
 for vn in data["view_names"]:
-    D = data["observations"][vn].shape[2]
-    y_pred = z @ learned_w[vn][:, :D]
-    r2 = variance_explained(data["observations"][vn], y_pred, data["patient_masks"])
-    print(f"  {vn}: {r2:.3f}")
+    print(f"  {vn}: {r2_result['total'][vn]:.1f}%")
+    print(f"    per factor: {[f'{x:.1f}%' for x in r2_result['per_factor'][vn]]}")

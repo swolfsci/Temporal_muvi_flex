@@ -165,18 +165,19 @@ def run_single(data_config: dict, model_config: dict, training_config: dict, see
     metrics["loading_aupr"] = {"overall": float(np.mean(aupr_all)), "mean": float(np.mean(aupr_all))}
     metrics["loading_correlation"] = {"mean": float(np.mean(corr_all))}
 
-    # Reconstruction & R² — use raw (unaligned) z and w together
-    for vn in data["view_names"]:
-        D_m = data["observations"][vn].shape[2]
-        y_pred = learned_z_trim @ learned_w[vn][:, :D_m]
-        y_true = data["observations"][vn][:, :T, :]
-        metrics[f"rmse_{vn}"] = reconstruction_rmse(y_true, y_pred, data["patient_masks"][:, :T])
-        metrics[f"r2_{vn}"] = variance_explained(y_true, y_pred, data["patient_masks"][:, :T])
-
-    r2_vals = [metrics[f"r2_{vn}"] for vn in data["view_names"]]
-    metrics["r2"] = float(np.mean(r2_vals))
-    rmse_vals = [metrics[f"rmse_{vn}"] for vn in data["view_names"]]
-    metrics["rmse"] = float(np.mean(rmse_vals))
+    # R² — use the model's own method (handles normalization correctly)
+    try:
+        r2_result = model.get_variance_explained(per_factor=True)
+        for vn in data["view_names"]:
+            metrics[f"r2_{vn}"] = r2_result["total"][vn]
+        r2_vals = [r2_result["total"][vn] for vn in data["view_names"]]
+        metrics["r2"] = float(np.mean(r2_vals))
+        metrics["r2_per_factor"] = {
+            vn: r2_result["per_factor"][vn].tolist() for vn in data["view_names"]
+        }
+    except Exception as e:
+        log.warning(f"Could not compute R²: {e}")
+        metrics["r2"] = None
 
     # GP metrics (if temporal factors exist)
     n_temporal = int(data["true_is_temporal"].sum())
