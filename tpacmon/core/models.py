@@ -808,59 +808,6 @@ class TemporalPACMON:
         )
         self._guide = TemporalGuide(self._model)
 
-    @torch.no_grad()
-    def _warmstart_guide(self):
-        """Initialize guide factor means from truncated SVD of observations.
-
-        Solves the scale indeterminacy problem: without warm-start, the KL
-        penalty on N(0,1) factor priors prevents the guide from learning
-        factor scores at the correct magnitude.
-        """
-        from sklearn.decomposition import TruncatedSVD
-
-        # Concatenate all views into (P*T_obs, D_total), skipping NaN rows
-        rows = []
-        row_map = []  # (patient_idx, time_idx) for each valid row
-        for p in range(self.n_patients):
-            for t in range(self.n_timepoints):
-                if self.patient_masks_np[p, t]:
-                    row = []
-                    for vn in self.view_names:
-                        r = self.observations[vn][p, t, :]
-                        if np.any(np.isnan(r)):
-                            break
-                        row.append(r)
-                    else:
-                        rows.append(np.concatenate(row))
-                        row_map.append((p, t))
-
-        if len(rows) < self.n_factors + 1:
-            return  # not enough data for SVD
-
-        X = np.array(rows, dtype=np.float32)
-        n_components = min(self.n_factors, X.shape[0] - 1, X.shape[1])
-        if n_components < 1:
-            return
-
-        svd = TruncatedSVD(n_components=n_components)
-        z_init = svd.fit_transform(X)  # (n_valid_rows, K)
-
-        # Scatter into guide.z_mean (P, K, T_max) and guide.eta_mean
-        z_mean = torch.zeros_like(self._guide.z_mean)
-        for i, (p, t) in enumerate(row_map):
-            for k in range(n_components):
-                z_mean[p, k, t] = float(z_init[i, k])
-
-        self._guide.z_mean.data.copy_(z_mean)
-        # eta_mean gets the same init — zeta mixing will sort out the split
-        self._guide.eta_mean.data.copy_(z_mean)
-
-        # Set initial scales proportional to factor variance
-        z_std = max(float(np.std(z_init)), 0.1)
-        self._guide.z_scale.data.fill_(z_std * 0.5)
-        self._guide.eta_scale.data.fill_(z_std * 0.5)
-
-        logger.info(f"Guide warm-started from SVD (z_std={z_std:.3f}, components={n_components})")
 
     def fit(
         self,
@@ -879,7 +826,6 @@ class TemporalPACMON:
         pyro.set_rng_seed(seed)
 
         self._setup_model_guide()
-        self._warmstart_guide()
 
         # Flatten observations
         obs, obs_mask, patient_idx, time_idx = self._flatten_observations()
