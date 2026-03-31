@@ -77,6 +77,7 @@ class TemporalModel(PyroModule):
         self.n_covariates = n_covariates
         self.kernel_name = kernel
         self.gp_scale = gp_scale
+        self.kl_weight = 1.0  # mutable — updated by training loop for KL annealing
         self.device = device
 
         # Time structure
@@ -207,13 +208,12 @@ class TemporalModel(PyroModule):
             output_dict["lengthscale"] = pyro.sample(
                 "lengthscale", dist.LogNormal(self._zeros((1,)), self._ones((1,)))
             )
+            output_dict["amplitude"] = pyro.sample(
+                "amplitude", dist.LogNormal(self._zeros((1,)), 0.5 * self._ones((1,)))
+            )
             output_dict["zeta"] = pyro.sample(
                 "zeta", dist.Beta(self._ones((1,)), self._ones((1,)))
             )
-
-        # Fixed unit amplitude — loadings absorb scale (as in MOFA2/MuVI).
-        # The kernel still provides temporal correlation via lengthscale.
-        output_dict["amplitude"] = self._ones((self.n_factors,))
 
         # --- Gamma (covariate effect on factor-level GP mean) ---
         if self.n_covariates > 0:
@@ -264,7 +264,11 @@ class TemporalModel(PyroModule):
 
             group_plate = pyro.plate(f"group_{g_idx}", n_group, dim=-1)
 
-            with pyro.poutine.scale(scale=self.gp_scale):
+            # KL annealing: scale down KL contribution of z priors early in training,
+            # preventing posterior collapse where factors stay near the N(0,1) prior.
+            kl_scale = self.gp_scale * self.kl_weight
+
+            with pyro.poutine.scale(scale=kl_scale):
                 with group_plate:
                     f_eps = pyro.sample(
                         f"f_g{g_idx}",
@@ -278,14 +282,15 @@ class TemporalModel(PyroModule):
             f_group = gp_means + torch.einsum("kij,nkj->nki", L_all, f_eps)
 
             # eta: i.i.d. component (n_group, K, T) — 1 sample call
-            with group_plate:
-                eta_group = pyro.sample(
-                    f"eta_g{g_idx}",
-                    dist.Normal(
-                        self._zeros((n_group, self.n_factors, n_t)),
-                        self._ones((n_group, self.n_factors, n_t)),
-                    ).to_event(2),
-                )  # (n_group, K, T)
+            with pyro.poutine.scale(scale=kl_scale):
+                with group_plate:
+                    eta_group = pyro.sample(
+                        f"eta_g{g_idx}",
+                        dist.Normal(
+                            self._zeros((n_group, self.n_factors, n_t)),
+                            self._ones((n_group, self.n_factors, n_t)),
+                        ).to_event(2),
+                    )  # (n_group, K, T)
 
             # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*amplitude*eta
             # f_group has marginal variance ~ amplitude² (from Cholesky of kernel),
@@ -357,6 +362,7 @@ class TemporalGuide(PyroModule):
             "view_scale": (n_views,),
             "factor_scale": (n_informed, n_views),
             "lengthscale": (n_factors,),
+            "amplitude": (n_factors,),
             "zeta": (n_factors,),
         }
 
@@ -475,7 +481,7 @@ class TemporalGuide(PyroModule):
         return self.mode("lengthscale").squeeze()
 
     def get_amplitudes(self):
-        return np.ones(self.model.n_factors, dtype=np.float32)
+        return self.mode("amplitude").squeeze()
 
     def get_zeta(self):
         return self.mode("zeta").squeeze()
@@ -525,6 +531,7 @@ class TemporalGuide(PyroModule):
         factor_plate = pyro.plate("factor", self.model.n_factors, device=self.model.device)
         with factor_plate:
             output_dict["lengthscale"] = self._sample_standard("lengthscale")
+            output_dict["amplitude"] = self._sample_standard("amplitude")
             output_dict["zeta"] = self._sample_standard("zeta")
 
         # --- Gamma ---
@@ -850,10 +857,17 @@ class TemporalPACMON:
                 min_epochs=min_epochs, tolerance=tolerance, patience=patience
             )
 
+        # KL annealing: ramp kl_weight from 0 → 1 over first kl_anneal_epochs
+        kl_anneal_epochs = min(n_epochs // 4, 500)
+
         # Training loop
         history = []
         pbar = trange(n_epochs, desc="Training")
         for epoch in pbar:
+            # Anneal KL weight on factor scores (0.01 → 1.0)
+            if kl_anneal_epochs > 0:
+                self._model.kl_weight = min(1.0, 0.01 + 0.99 * epoch / kl_anneal_epochs)
+
             loss = svi.step(obs, obs_mask, patient_idx, time_idx, covs)
 
             # Gradient clipping (only leaf tensors to avoid PyTorch warning)
