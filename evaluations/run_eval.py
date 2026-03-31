@@ -67,7 +67,8 @@ def run_single(data_config: dict, model_config: dict, training_config: dict, see
     # -------------------------------------------------------------------
     # Generate data
     # -------------------------------------------------------------------
-    gen_params = {**data_config, "seed": seed}
+    gen_params = {k: v for k, v in data_config.items() if not k.startswith("_")}
+    gen_params["seed"] = seed
     data = generate_evaluation_data(**gen_params)
 
     K_true = data["true_z"].shape[2]
