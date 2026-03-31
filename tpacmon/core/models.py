@@ -286,9 +286,13 @@ class TemporalModel(PyroModule):
                     ).to_event(2),
                 )  # (n_group, K, T)
 
-            # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*eta
+            # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*amplitude*eta
+            # f_group has marginal variance ~ amplitude² (from Cholesky of kernel),
+            # eta_group is N(0,1), so scale by amplitude to match.
             zeta_exp = zetas.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
-            z_group = torch.sqrt(1 - zeta_exp) * f_group + torch.sqrt(zeta_exp) * eta_group
+            amp_exp = amplitudes.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
+            z_group = (torch.sqrt(1 - zeta_exp) * f_group
+                       + torch.sqrt(zeta_exp) * amp_exp * eta_group)
 
             # Scatter into z_all: map group patients to their obs rows
             for i, p in enumerate(group_pats):
