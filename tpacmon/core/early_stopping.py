@@ -7,12 +7,23 @@ logger = logging.getLogger(__name__)
 
 
 class EarlyStoppingCallback:
-    """Stop training when ELBO improvement stalls."""
+    """Stop training when smoothed ELBO improvement stalls.
 
-    def __init__(self, min_epochs: int = 100, tolerance: float = 1e-5, patience: int = 10):
+    Uses an exponential moving average of the ELBO to smooth out the
+    stochastic noise inherent in SVI, preventing premature stopping.
+    """
+
+    def __init__(
+        self,
+        min_epochs: int = 100,
+        tolerance: float = 1e-5,
+        patience: int = 10,
+        smoothing: int = 50,
+    ):
         self.min_epochs = min_epochs
         self.tolerance = tolerance
         self.patience = patience
+        self.smoothing = smoothing
         self._counter = 0
         self._best_loss = np.inf
 
@@ -21,7 +32,10 @@ class EarlyStoppingCallback:
         if epoch < self.min_epochs:
             return False
 
-        current = history[-1]
+        # Use moving average to smooth SVI noise
+        window = min(self.smoothing, len(history))
+        current = np.mean(history[-window:])
+
         if current < self._best_loss - self.tolerance * abs(self._best_loss):
             self._best_loss = current
             self._counter = 0
