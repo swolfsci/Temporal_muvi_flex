@@ -474,6 +474,16 @@ def results_to_csv_row(result: dict) -> dict:
 
     # Alignment quality
     if "alignment" in m:
-        row["alignment_corr_mean"] = float(np.mean(m["alignment"]["correlations"]))
+        row["alignment_corr_mean"] = float(np.mean(np.abs(m["alignment"]["correlations"])))
+
+    # Training info
+    if "epochs_run" in m:
+        row["epochs_run"] = m["epochs_run"]
+    if "final_loss" in m:
+        row["final_loss"] = m["final_loss"]
+
+    # Zeta
+    if "zeta_mean" in m:
+        row["zeta_mean"] = m["zeta_mean"]
 
     return row
