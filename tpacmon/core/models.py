@@ -212,10 +212,7 @@ class TemporalModel(PyroModule):
                 "amplitude", dist.LogNormal(self._zeros((1,)), 0.5 * self._ones((1,)))
             )
             output_dict["zeta"] = pyro.sample(
-                # Beta(1, 2) biases toward lower zeta (more GP structure),
-                # encouraging temporal factors to use the GP branch before
-                # falling back to i.i.d. Mean = 1/3 instead of 1/2.
-                "zeta", dist.Beta(self._ones((1,)), 2.0 * self._ones((1,)))
+                "zeta", dist.Beta(self._ones((1,)), self._ones((1,)))
             )
 
         # --- Gamma (covariate effect on factor-level GP mean) ---
@@ -396,13 +393,11 @@ class TemporalGuide(PyroModule):
         # Register standard params
         for name, shape in site_to_shape.items():
             if name == "zeta":
-                # Initialize guide Beta(a=2, b=3) → mode=0.25, matching
-                # the asymmetric prior Beta(1, 2) that biases toward GP.
                 setattr(self.locs, name, PyroParam(
                     2.0 * self.model._ones(shape), constraints.positive
                 ))
                 setattr(self.scales, name, PyroParam(
-                    3.0 * self.model._ones(shape), constraints.positive
+                    2.0 * self.model._ones(shape), constraints.positive
                 ))
             else:
                 setattr(self.locs, name, PyroParam(
