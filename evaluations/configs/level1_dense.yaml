@@ -1,0 +1,27 @@
+name: level1_dense
+level: 1
+n_seeds: 5
+
+data:
+  n_patients: 50
+  n_timepoints: 6
+  n_views: 2
+  n_features: [200, 150]
+  n_temporal_factors: 0
+  n_iid_factors: 3
+  noise_std: 0.5
+  missing_rate: 0.0
+
+model:
+  n_dense_factors: 3
+  kernel: matern32
+
+training:
+  n_epochs: 2000
+  learning_rate: 0.01
+  early_stopping: true
+  patience: 20
+  min_epochs: 100
+
+sweep:
+  noise_std: [0.1, 0.3, 0.5, 1.0, 2.0]
