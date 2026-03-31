@@ -41,3 +41,27 @@ r2_result = model.get_variance_explained(per_factor=True)
 for vn in data["view_names"]:
     print(f"  {vn}: {r2_result['total'][vn]:.1f}%")
     print(f"    per factor: {[f'{x:.1f}%' for x in r2_result['per_factor'][vn]]}")
+
+import numpy as np
+from evaluations.metrics import apply_alignment
+
+print(f"\n=== Loading magnitude diagnosis ===")
+learned_w = model.get_loadings()
+for vn in data["view_names"]:
+    true_w = data["true_w"][vn]
+    lw = apply_alignment(learned_w[vn], alignment, axis=0)
+
+    print(f"  {vn}:")
+    print(f"    True W  — mean|w|: {np.mean(np.abs(true_w)):.4f}, max|w|: {np.max(np.abs(true_w)):.4f}, nonzero: {np.count_nonzero(true_w)}/{true_w.size}")
+    print(f"    Learned W — mean|w|: {np.mean(np.abs(lw)):.4f}, max|w|: {np.max(np.abs(lw)):.4f}")
+    print(f"    Ratio (learned/true mean|w|): {np.mean(np.abs(lw)) / np.mean(np.abs(true_w)):.3f}")
+
+    # Check per-factor
+    for k in range(true_w.shape[0]):
+        true_active = np.abs(true_w[k]) > 0
+        print(f"    Factor {k}: true active={true_active.sum()}, learned mean|w| on active={np.mean(np.abs(lw[k, true_active])):.4f}, true mean|w| on active={np.mean(np.abs(true_w[k, true_active])):.4f}")
+
+print(f"\n=== Factor score magnitude ===")
+print(f"  True z  — std: {np.nanstd(data['true_z']):.4f}")
+print(f"  Learned z — std: {np.nanstd(z):.4f}")
+print(f"  Ratio: {np.nanstd(z) / np.nanstd(data['true_z']):.3f}")
