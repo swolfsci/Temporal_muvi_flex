@@ -194,24 +194,37 @@ def run_single(data_config: dict, model_config: dict, training_config: dict, see
     metrics["zeta_per_factor"] = learned_zeta.tolist()
 
     # Covariate metrics
+    # gamma: factor-level covariate effect (C, K) — accessed via guide
     if data["true_gamma"] is not None:
         try:
-            learned_gamma = model.get_covariate_coefficients()
+            learned_gamma = model._guide.mode("gamma")  # (C, K)
             if learned_gamma is not None:
-                # gamma is factor-level: (C, K)
                 metrics["gamma_recovery"] = gamma_recovery(
                     data["true_gamma"], learned_gamma, alignment
                 )
         except Exception as e:
             log.warning(f"Could not extract gamma: {e}")
 
+    # beta: feature-level covariate effect {view: (C, D)} — via get_covariate_coefficients
     if data["true_beta"] is not None:
         try:
-            learned_beta = model.get_covariate_coefficients()
-            # beta recovery would need feature-level extraction
-            # placeholder for when feature-level beta extraction is available
-        except Exception:
-            pass
+            learned_betas = model.get_covariate_coefficients()  # {view: (C, D)}
+            beta_corrs, beta_auprs = [], []
+            for vn in data["view_names"]:
+                if vn in learned_betas and vn in data["true_beta"]:
+                    br = beta_recovery(data["true_beta"][vn], learned_betas[vn])
+                    metrics[f"beta_recovery_{vn}"] = br
+                    if br["correlation"] is not None and np.isfinite(br["correlation"]):
+                        beta_corrs.append(br["correlation"])
+                    if br["aupr"] is not None and np.isfinite(br["aupr"]):
+                        beta_auprs.append(br["aupr"])
+            if beta_corrs:
+                metrics["beta_recovery"] = {
+                    "correlation": float(np.mean(beta_corrs)),
+                    "aupr": float(np.mean(beta_auprs)) if beta_auprs else None,
+                }
+        except Exception as e:
+            log.warning(f"Could not extract beta: {e}")
 
     # Training info
     history = model.training_history if hasattr(model, "training_history") else []
