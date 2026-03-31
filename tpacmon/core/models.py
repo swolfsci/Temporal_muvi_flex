@@ -207,12 +207,13 @@ class TemporalModel(PyroModule):
             output_dict["lengthscale"] = pyro.sample(
                 "lengthscale", dist.LogNormal(self._zeros((1,)), self._ones((1,)))
             )
-            output_dict["amplitude"] = pyro.sample(
-                "amplitude", dist.LogNormal(self._zeros((1,)), 0.5 * self._ones((1,)))
-            )
             output_dict["zeta"] = pyro.sample(
                 "zeta", dist.Beta(self._ones((1,)), self._ones((1,)))
             )
+
+        # Fixed unit amplitude — loadings absorb scale (as in MOFA2/MuVI).
+        # The kernel still provides temporal correlation via lengthscale.
+        output_dict["amplitude"] = self._ones((self.n_factors,))
 
         # --- Gamma (covariate effect on factor-level GP mean) ---
         if self.n_covariates > 0:
@@ -356,7 +357,6 @@ class TemporalGuide(PyroModule):
             "view_scale": (n_views,),
             "factor_scale": (n_informed, n_views),
             "lengthscale": (n_factors,),
-            "amplitude": (n_factors,),
             "zeta": (n_factors,),
         }
 
@@ -475,7 +475,7 @@ class TemporalGuide(PyroModule):
         return self.mode("lengthscale").squeeze()
 
     def get_amplitudes(self):
-        return self.mode("amplitude").squeeze()
+        return np.ones(self.model.n_factors, dtype=np.float32)
 
     def get_zeta(self):
         return self.mode("zeta").squeeze()
@@ -525,7 +525,6 @@ class TemporalGuide(PyroModule):
         factor_plate = pyro.plate("factor", self.model.n_factors, device=self.model.device)
         with factor_plate:
             output_dict["lengthscale"] = self._sample_standard("lengthscale")
-            output_dict["amplitude"] = self._sample_standard("amplitude")
             output_dict["zeta"] = self._sample_standard("zeta")
 
         # --- Gamma ---
