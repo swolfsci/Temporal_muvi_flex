@@ -65,3 +65,12 @@ print(f"\n=== Factor score magnitude ===")
 print(f"  True z  — std: {np.nanstd(data['true_z']):.4f}")
 print(f"  Learned z — std: {np.nanstd(z):.4f}")
 print(f"  Ratio: {np.nanstd(z) / np.nanstd(data['true_z']):.3f}")
+
+print(f"\n=== Guide internals ===")
+guide = model._guide
+print(f"  eta_mean range: [{guide.eta_mean.min().item():.4f}, {guide.eta_mean.max().item():.4f}]")
+print(f"  eta_scale range: [{guide.eta_scale.min().item():.4f}, {guide.eta_scale.max().item():.4f}]")
+print(f"  z_mean range: [{guide.z_mean.min().item():.4f}, {guide.z_mean.max().item():.4f}]")
+print(f"  z_scale range: [{guide.z_scale.min().item():.4f}, {guide.z_scale.max().item():.4f}]")
+print(f"  Learned amplitude: {guide.mode('amplitude')}")
+print(f"  Learned zeta: {guide.mode('zeta')}")
