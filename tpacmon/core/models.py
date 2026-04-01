@@ -961,7 +961,15 @@ class TemporalPACMON:
             self._model.force_zeta_one = False
 
         # --- Phase 2: full model (GP active) ---
+        # Fresh early stopping for phase 2 (phase 1 history doesn't count)
+        es_callback_p2 = None
+        if early_stopping:
+            es_callback_p2 = EarlyStoppingCallback(
+                min_epochs=min_epochs, tolerance=tolerance, patience=patience
+            )
+
         kl_anneal_p2 = min(phase2_epochs // 4, 500)
+        phase2_history = []
         pbar2 = trange(phase2_epochs, desc="Phase 2 (full)")
         for epoch in pbar2:
             if kl_anneal_p2 > 0:
@@ -969,9 +977,10 @@ class TemporalPACMON:
 
             loss = _train_step(len(history), clip_norm)
             history.append(loss)
+            phase2_history.append(loss)
             pbar2.set_postfix({"ELBO": f"{loss:.2f}"})
 
-            if es_callback and es_callback(history):
+            if es_callback_p2 and es_callback_p2(phase2_history):
                 break
 
         self._training_history = history
