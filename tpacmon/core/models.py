@@ -78,7 +78,6 @@ class TemporalModel(PyroModule):
         self.kernel_name = kernel
         self.gp_scale = gp_scale
         self.kl_weight = 1.0  # mutable — updated by training loop for KL annealing
-        self.force_zeta_one = False  # set True during phase 1 to skip GP
         self.device = device
 
         # Time structure
@@ -296,14 +295,10 @@ class TemporalModel(PyroModule):
             # Mix: z = sqrt(1-zeta)*f + sqrt(zeta)*amplitude*eta
             # f_group has marginal variance ~ amplitude² (from Cholesky of kernel),
             # eta_group is N(0,1), so scale by amplitude to match.
+            zeta_exp = zetas.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
             amp_exp = amplitudes.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
-            if self.force_zeta_one:
-                # Phase 1: pure i.i.d. mode, skip GP entirely
-                z_group = amp_exp * eta_group
-            else:
-                zeta_exp = zetas.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
-                z_group = (torch.sqrt(1 - zeta_exp) * f_group
-                           + torch.sqrt(zeta_exp) * amp_exp * eta_group)
+            z_group = (torch.sqrt(1 - zeta_exp) * f_group
+                       + torch.sqrt(zeta_exp) * amp_exp * eta_group)
 
             # Scatter into z_all: map group patients to their obs rows
             for i, p in enumerate(group_pats):
@@ -814,69 +809,6 @@ class TemporalPACMON:
         self._guide = TemporalGuide(self._model)
 
 
-    @torch.no_grad()
-    def _init_loadings_from_svd(self):
-        """Initialize guide loading locs from truncated SVD of observations.
-
-        Gives the horseshoe a PCA-informed starting point for loadings.
-        Unlike factor score init, this doesn't conflict with prior mask
-        structure — the horseshoe refines from here, shrinking irrelevant
-        features.
-        """
-        from sklearn.decomposition import TruncatedSVD
-
-        # Flatten (P, T, D_m) → (N_obs, D_total)
-        rows = []
-        for p in range(self.n_patients):
-            for t in range(self.n_timepoints):
-                if self.patient_masks_np[p, t]:
-                    row = []
-                    valid = True
-                    for vn in self.view_names:
-                        r = self.observations[vn][p, t, :]
-                        if np.any(np.isnan(r)):
-                            valid = False
-                            break
-                        row.append(r)
-                    if valid:
-                        rows.append(np.concatenate(row))
-
-        if len(rows) < self.n_factors + 1:
-            return
-
-        X = np.array(rows, dtype=np.float32)
-        n_components = min(self.n_factors, X.shape[0] - 1, X.shape[1])
-        if n_components < 1:
-            return
-
-        svd = TruncatedSVD(n_components=n_components)
-        svd.fit(X)
-        components = svd.components_  # (K, D_total)
-
-        # Split components per view and copy into guide loading locs
-        offset = 0
-        for m, vn in enumerate(self.view_names):
-            D_m = self.n_features[vn]
-            w_init = components[:, offset:offset + D_m]  # (K, D_m)
-            offset += D_m
-
-            n_informed = self.n_sparse_factors
-            n_dense = self.n_dense_factors
-
-            if n_informed > 0 and hasattr(self._guide.locs, f"w_sparse_{m}"):
-                loc = getattr(self._guide.locs, f"w_sparse_{m}")
-                n_copy = min(n_informed, w_init.shape[0])
-                loc.data[:n_copy] = torch.tensor(w_init[:n_copy], device=self.device)
-
-            if n_dense > 0 and hasattr(self._guide.locs, f"w_dense_{m}"):
-                loc = getattr(self._guide.locs, f"w_dense_{m}")
-                start = n_informed
-                n_copy = min(n_dense, max(0, w_init.shape[0] - start))
-                if n_copy > 0:
-                    loc.data[:n_copy] = torch.tensor(w_init[start:start + n_copy], device=self.device)
-
-        logger.info(f"Loadings initialized from SVD ({n_components} components)")
-
     def fit(
         self,
         n_epochs: int = 1000,
@@ -894,7 +826,6 @@ class TemporalPACMON:
         pyro.set_rng_seed(seed)
 
         self._setup_model_guide()
-        self._init_loadings_from_svd()
 
         # Flatten observations
         obs, obs_mask, patient_idx, time_idx = self._flatten_observations()
@@ -920,67 +851,37 @@ class TemporalPACMON:
             loss=loss_fn,
         )
 
-        # Two-phase training:
-        # Phase 1: freeze zeta at 1.0 (i.i.d. mode) — loadings converge cleanly
-        # Phase 2: unfreeze zeta — GP engages from good loading starting point
-        phase1_epochs = min(n_epochs // 3, 500)
-        phase2_epochs = n_epochs - phase1_epochs
-
-        # Early stopping (phase 2 only)
+        # Early stopping
         es_callback = None
         if early_stopping:
             es_callback = EarlyStoppingCallback(
                 min_epochs=min_epochs, tolerance=tolerance, patience=patience
             )
 
-        history = []
+        # KL annealing: ramp kl_weight from 0 → 1 over first kl_anneal_epochs
+        kl_anneal_epochs = min(n_epochs // 4, 500)
 
-        def _train_step(epoch_global, clip_norm):
+        # Training loop
+        history = []
+        pbar = trange(n_epochs, desc="Training")
+        for epoch in pbar:
+            # Anneal KL weight on factor scores (0.01 → 1.0)
+            if kl_anneal_epochs > 0:
+                self._model.kl_weight = min(1.0, 0.01 + 0.99 * epoch / kl_anneal_epochs)
+
             loss = svi.step(obs, obs_mask, patient_idx, time_idx, covs)
+
+            # Gradient clipping (only leaf tensors to avoid PyTorch warning)
             if clip_norm > 0:
                 params = [p for p in pyro.get_param_store().values()
                           if p.requires_grad and p.is_leaf and p.grad is not None]
                 if params:
                     torch.nn.utils.clip_grad_norm_(params, clip_norm)
-            return loss
 
-        # --- Phase 1: i.i.d. mode (zeta forced to 1.0 via model flag) ---
-        if phase1_epochs > 0:
-            self._model.force_zeta_one = True  # model forward will skip GP
-
-            kl_anneal_p1 = min(phase1_epochs // 4, 200)
-            pbar1 = trange(phase1_epochs, desc="Phase 1 (i.i.d.)")
-            for epoch in pbar1:
-                if kl_anneal_p1 > 0:
-                    self._model.kl_weight = min(1.0, 0.01 + 0.99 * epoch / kl_anneal_p1)
-                loss = _train_step(epoch, clip_norm)
-                history.append(loss)
-                pbar1.set_postfix({"ELBO": f"{loss:.2f}"})
-
-            logger.info(f"Phase 1 complete ({phase1_epochs} epochs). ELBO: {history[-1]:.2f}")
-            self._model.force_zeta_one = False
-
-        # --- Phase 2: full model (GP active) ---
-        # Fresh early stopping for phase 2 (phase 1 history doesn't count)
-        es_callback_p2 = None
-        if early_stopping:
-            es_callback_p2 = EarlyStoppingCallback(
-                min_epochs=min_epochs, tolerance=tolerance, patience=patience
-            )
-
-        kl_anneal_p2 = min(phase2_epochs // 4, 500)
-        phase2_history = []
-        pbar2 = trange(phase2_epochs, desc="Phase 2 (full)")
-        for epoch in pbar2:
-            if kl_anneal_p2 > 0:
-                self._model.kl_weight = min(1.0, 0.01 + 0.99 * epoch / kl_anneal_p2)
-
-            loss = _train_step(len(history), clip_norm)
             history.append(loss)
-            phase2_history.append(loss)
-            pbar2.set_postfix({"ELBO": f"{loss:.2f}"})
+            pbar.set_postfix({"ELBO": f"{loss:.2f}"})
 
-            if es_callback_p2 and es_callback_p2(phase2_history):
+            if es_callback and es_callback(history):
                 break
 
         self._training_history = history
